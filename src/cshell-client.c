@@ -579,7 +579,36 @@ int main(int argc, char *argv[])
 
 
   /* run event loop */
-  process_tunnel_packets(tunfd);
+  //process_tunnel_packets(tunfd);
+
+  {
+    int listen_so = tcp_listen(ifaceip, 6444);
+    if ( listen_so == -1 ) {
+      CF_FATAL("tcp_listen() fails");
+      return 1;
+    }
+
+    CF_DEBUG("Listen started!!!!");
+    int so = accept(listen_so, NULL, 0);
+
+    CF_DEBUG("Accepted NEW TCP connection");
+
+    char buf[4*1024] = "";
+
+    ssize_t cb = recv(so, buf, sizeof(buf)-1, 0);
+
+    printf("%s\n", buf);
+
+
+
+
+    close(so);
+
+
+
+  }
+
+
 
 
   return 0;

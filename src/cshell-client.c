@@ -546,7 +546,7 @@ static void dumppkt2(const char * prefix,
 }
 
 /* read from tunnel, update destination and send to raw socket */
-static ssize_t rdtun(int tunfd, int rawfd)
+static ssize_t rdtun(int tunfd)
 {
   const size_t MAX_PKT_SIZE = 4 * 1024;    // MUST BE >= MAX POSSIBLE MTU
   uint32_t pktbuf[MAX_PKT_SIZE / sizeof(uint32_t)];
@@ -631,87 +631,6 @@ static ssize_t rdtun(int tunfd, int rawfd)
   return cb;
 }
 
-/* read from raw socket and write to tun */
-//static ssize_t rdraw(int rawfd, int tunfd)
-//{
-//  const size_t MAX_PKT_SIZE = 4 * 1024;    // MUST BE >= MAX POSSIBLE MTU
-//  uint32_t pktbuf[MAX_PKT_SIZE / sizeof(uint32_t)];
-//  ssize_t pktsize;
-//
-//  struct ip * ip;
-//  size_t iphsize;
-//  struct tcphdr * tcp;
-//  size_t tcphsize;
-//  void * tcppld;
-//  size_t pldsize;
-//
-//  struct sockaddr_in ssin;
-//  socklen_t ssin_len = sizeof(ssin);
-//
-//  CF_DEBUG("\n\nsrcfd=%d dstfd=%d", rawfd, tunfd);
-//
-//  if ( (pktsize = recvfrom(rawfd, pktbuf, sizeof(pktbuf), MSG_DONTWAIT, &ssin, &ssin_len )) > 0 ) {
-//
-//    CF_DEBUG("pktsize=%zd from %s:%u", pktsize, inet_ntoa(ssin.sin_addr), ntohs(ssin.sin_port));
-//
-//    if ( !parsepkt(pktbuf, pktsize, &ip, &iphsize, &tcp, &tcphsize, &tcppld, &pldsize) ) {
-//      CF_DEBUG("PKT ignored");
-//      //return 0;
-//    }
-//    else {
-////      CF_DEBUG("SRC=%s:%u", inet_ntoa(ip->ip_src), ntohs(tcp->source));
-////      CF_DEBUG("DST=%s:%u", inet_ntoa(ip->ip_dst), ntohs(tcp->dest));
-////      CF_DEBUG("CHK=%u", ntohs(ip->ip_sum));
-////      CF_DEBUG("SYN=%u", tcp->syn);
-////      CF_DEBUG("ACK=%u", tcp->ack);
-////      CF_DEBUG("SEQ=%u", tcp->seq);
-////
-////      if ( pldsize > 0 ) {
-////        *((char*)tcppld + pldsize) = 0;
-////        CF_DEBUG("PLD='%s'", tcppld);
-////      }
-//
-//
-//      if ( ip->ip_dst.s_addr == tcpdst->sin_addr.s_addr && tcp->dest == ntohs(6001) ) {    // inet_addr("10.10.100.1")
-//        CF_NOTICE("Self-Echo");
-//      }
-//      else if ( ip->ip_src.s_addr == tcpdst->sin_addr.s_addr && tcp->source == ntohs(6001) )  {
-//        ssize_t pos = rtable_find_source(ip->ip_dst, tcp->dest);
-//        CF_NOTICE("pos=%zd", pos);
-//        if ( pos >= 0 ) {
-//          struct rtable_item * item = ccarray_peek(&rtable, pos);
-//
-//          ip->ip_src.s_addr = item->dst.sin_addr.s_addr;
-//          tcp->source = item->dst.sin_port;
-//          update_ip_checksum(ip);
-//          update_tcp_checksum(ip);
-//
-//          CF_DEBUG("W SRC=%s:%u", inet_ntoa(ip->ip_src), ntohs(tcp->source));
-//          CF_DEBUG("W DST=%s:%u", inet_ntoa(ip->ip_dst), ntohs(tcp->dest));
-//          CF_DEBUG("W CHK=%u", ntohs(ip->ip_sum));
-//          CF_DEBUG("W SYN=%u", tcp->syn);
-//          CF_DEBUG("W ACK=%u", tcp->ack);
-//          CF_DEBUG("W SEQ=%u", tcp->seq);
-//          if ( pldsize > 0 ) {
-//            *((char*) tcppld + pldsize) = 0;
-//            CF_DEBUG("W PLD='%s'", (char*)tcppld);
-//          }
-//
-//
-//          ssize_t cb = write(tunfd, ip, ntohs(ip->ip_len));
-//          if ( cb <= 0 ) {
-//            CF_FATAL("write(tunfd) fails: %s", strerror(errno));
-//          }
-//        }
-//      }
-//      CF_DEBUG("\n");
-//    }
-//  }
-//
-//
-//  return pktsize;
-//}
-
 
 
 
@@ -743,50 +662,6 @@ static void process_tunnel_packets(int tunfd1)
     goto __end;
   }
 
-  /* manage tcpfd to listen incoming TCP connections */
-//  if ( !epoll_add(epollfd, tcpfd, EPOLLIN) ) {
-//    CF_FATAL("epoll_(epollfd=%d, tcpfd=%d) fails: %s", epollfd, tcpfd, strerror(errno));
-//    goto __end;
-//  }
-
-
-  // http://www.binarytides.com/raw-sockets-c-code-linux/
-//  if ( (rawfd = socket(PF_INET, SOCK_RAW, IPPROTO_TCP)) == -1 ) {
-//    CF_FATAL("SOCK_RAW fails: %s", strerror(errno));
-//    goto __end;
-//  }
-//
-//
-//  if ( !so_set_ip_hdrincl(rawfd, true) ) {
-//    CF_FATAL("FATAL: so_set_ip_hdrincl(true) fails: %s", strerror(errno));
-//    goto __end;
-//  }
-//
-//  {
-//    struct sockaddr_in src_sin;
-//    so_sockaddr_in("10.10.100.1", 6002, &src_sin);
-//    if ( bind(rawfd, (struct sockaddr*) &src_sin, sizeof(src_sin)) == -1 ) {
-//      CF_FATAL("bind() fails: %s", strerror(errno));
-//    }
-//  }
-
-//  if ( connect(rawfd, (struct sockaddr*) tcpdst, sizeof(*tcpdst)) != 0 ) {
-//    CF_FATAL("connect(rawfd) fails: %s", strerror(errno));
-//  }
-
-//  if ( !epoll_add(epollfd, rawfd, EPOLLIN) ) {
-//    CF_FATAL("epoll_(epollfd=%d, rawfd=%d) fails: %s", epollfd, rawfd, strerror(errno));
-//    goto __end;
-//  }
-
-
-//  {
-//    struct sockaddr_in src_sin;
-//    socklen_t src_sin_len = sizeof(src_sin);
-//    getsockname(rawfd, &src_sin, &src_sin_len);
-//    CF_DEBUG("rawfd bound to %s:%u", inet_ntoa(src_sin.sin_addr), ntohs(src_sin.sin_port));
-//  }
-
   // fixme: may be ignore errno == EINTR ?
   while ( (n = epoll_wait(epollfd, events, MAX_EPOLL_EVENTS, -1)) >= 0 && !fail ) {
 
@@ -796,33 +671,9 @@ static void process_tunnel_packets(int tunfd1)
 
       if ( e->data.fd == tunfd1 ) {
         if ( e->events & EPOLLIN ) {
-          rdtun(tunfd1, -1/*rawfd*/);
+          rdtun(tunfd1);
         }
       }
-//      else if ( e->data.fd == rawfd ) {
-//        if ( e->events & EPOLLIN ) {
-//          rdraw(rawfd, tunfd1);
-//        }
-//      }
-
-//      else if ( e->data.fd == tcpfd ) {
-//        if ( e->events & EPOLLIN ) {
-//
-//          struct sockaddr_in address_from;
-//          socklen_t address_from_len = sizeof(address_from);
-//          int so;
-//
-//          CF_DEBUG("new TCP connection requested");
-//
-//          if ( (so = accept(tcpfd, (struct sockaddr*)&address_from, &address_from_len)) == -1 ) {
-//            CF_FATAL("TCP accept fails: %s", strerror(errno));
-//          }
-//          else {
-//            CF_DEBUG("new TCP connection from %s:%u", inet_ntoa(address_from.sin_addr), ntohs(address_from.sin_port));
-//            close(so);
-//          }
-//        }
-//      }
     }
   }
 

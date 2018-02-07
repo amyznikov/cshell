@@ -25,6 +25,9 @@ static void * cshell_server_client_thread(void * arg)
 {
   int so = (int)(ssize_t)(arg);
   char buf[4096] = "";
+
+
+
   recv(so, buf, sizeof(buf)-1, 0);
   CF_CRITICAL("%s\n", buf);
 

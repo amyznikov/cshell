@@ -4,6 +4,7 @@
  *  Raw TCP packets
  *    Silver Moon (m00n.silv3r@gmail.com)
  */
+#include<unistd.h>
 #include<stdio.h> //for printf
 #include<string.h> //memset
 #include<sys/socket.h>    //for socket ofcourse
@@ -23,6 +24,8 @@ static void * mircosrv_thread(void * arg)
 {
   int so1, so2;
   struct sockaddr_in sin;
+
+  (void)(arg);
 
   pthread_detach(pthread_self());
 

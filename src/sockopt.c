@@ -293,4 +293,30 @@ __end:
 }
 
 
+int so_tcp_connect(struct sockaddr_in * addrs)
+{
+  bool fOk = false;
+  int so = -1;
+
+  if ((so = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1 ) {
+    goto __end;
+  }
+
+  if ( connect(so, (struct sockaddr *)addrs, sizeof(*addrs)) == -1 ) {
+    goto __end;
+  }
+
+  fOk = true;
+
+__end:
+
+  if ( !fOk ) {
+    if ( so != -1 ) {
+      close(so), so = -1;
+    }
+  }
+
+  return so;
+}
+
 

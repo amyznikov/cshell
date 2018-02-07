@@ -200,27 +200,114 @@ static inline bool epoll_remove(int epollfd, int so)
 static char g_bindaddrs[256];
 struct sockaddr_in g_tcpserver_address;
 
+struct sockaddr_in g_master_server_address;
+
 
 
 static void * microsrv_client_thread(void * arg)
 {
-  int so = (int)(ssize_t)(arg);
-  char buf[4096] = "";
-  recv(so, buf, sizeof(buf)-1, 0);
-  CF_CRITICAL("%s\n", buf);
+  int so1 = (int)(ssize_t)(arg);
+  int so2 = -1;
 
-  //char msg[1024] = "HTTP/1.1 404 Not Found\r\n\r\n";
+  CF_DEBUG("Try to connect to smaster %s:%u", inet_ntoa(g_master_server_address.sin_addr), ntohs(g_master_server_address.sin_port));
+
+  if ( (so2 = so_tcp_connect(&g_master_server_address)) == -1 ) {
+    CF_FATAL("so_tcp_connect() fails: %s", strerror(errno));
+
+    char buf[4096] = "";
+    ssize_t cb1, cb2;
+    recv(so1, buf, sizeof(buf) - 1, MSG_DONTWAIT);
+
+    char msg[1024] = "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html; charset=ISO-8859-1\r\n"
+        "\r\n"
+        "<HTML> Can not connect master server</HTML>\r\n";
+
+    send(so1, msg, strlen(msg), 0);
+    close (so1);
+  }
+  else {
 
 
-  sleep(rand() % 7);
+    static const int MAX_EPOLL_EVENTS = 100;
+    struct epoll_event events[MAX_EPOLL_EVENTS];
+    struct epoll_event * e;
+    int epollfd = -1;
+    bool fail = false;
 
-  char msg[1024] = "HTTP/1.1 200 OK\r\n"
-      "Content-Type: text/html; charset=ISO-8859-1\r\n"
-      "\r\n"
-      "<HTML> Hello, world!</HTML>\r\n";
+    char buf[4096] = "";
+    ssize_t cb1, cb2;
+    int i, n;
 
-  send(so, msg, strlen(msg) + 1, 0);
-  close(so);
+
+    /* create epoll listener */
+    if ( (epollfd = epoll_create1(0)) == -1 ) {
+      CF_FATAL("epoll_create1() fails: %s", strerror(errno));
+    }
+
+
+    /* manage so to listen input packets */
+    if ( !epoll_add(epollfd, so1, EPOLLIN) ) {
+      CF_FATAL("epoll_(epollfd=%d, so1=%d) fails: %s", epollfd, so1, strerror(errno));
+    }
+    if ( !epoll_add(epollfd, so2, EPOLLIN) ) {
+      CF_FATAL("epoll_(epollfd=%d, so2=%d) fails: %s", epollfd, so2, strerror(errno));
+    }
+
+
+    CF_DEBUG("so1 = %d", so1);
+    CF_DEBUG("so2 = %d", so2);
+
+    while ( (n = epoll_wait(epollfd, events, MAX_EPOLL_EVENTS, -1)) >= 0 && !fail ) {
+
+      CF_DEBUG("epoll: n=%d", n);
+
+      for ( i = 0; i < n; ++i ) {
+
+        e = &events[i];
+
+        CF_DEBUG("epoll: events[i=%d] = 0x%0X fd=%d", i, e->events, e->data.fd);
+
+        if ( e->events & EPOLLIN ) {
+
+          if ( e->data.fd == so1 ) {
+            if ( (cb1 = recv(so1, buf, sizeof(buf), 0)) <= 0 ) {
+              CF_FATAL("recv(so1) fails: %s", strerror(errno));
+              fail = true;
+              break;
+            }
+
+            if ( (cb2 = send(so2, buf, cb1, 0)) != cb1 ) {
+              CF_FATAL("send(so2) fails: %s", strerror(errno));
+              fail = true;
+              break;
+            }
+          }
+          else if ( e->data.fd == so2 ) {
+            if ( (cb2 = recv(so2, buf, sizeof(buf), 0)) <= 0 ) {
+              CF_FATAL("recv(so2) fails: %s", strerror(errno));
+              fail = true;
+              break;
+            }
+
+            if ( (cb1 = send(so1, buf, cb2, 0)) != cb2 ) {
+              CF_FATAL("send(so1) fails: %s", strerror(errno));
+              fail = true;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    CF_DEBUG("\n==========================\n");
+    close(so1);
+    close(so2);
+    close(epollfd);
+    CF_DEBUG("CONNECTIONS CLOSED");
+    CF_DEBUG("\n==========================\n");
+  }
+
 
   pthread_detach(pthread_self());
   return NULL;
@@ -248,7 +335,7 @@ static void * mircosrv_thread(void * arg)
     pthread_t pid;
     status = pthread_create(&pid, NULL, microsrv_client_thread, (void*)(ssize_t)(so2));
     if ( status ) {
-      CF_FATAL("pthread_create() fauls: %s", strerror(status));
+      CF_FATAL("pthread_create() fails: %s", strerror(status));
     }
   }
 
@@ -339,15 +426,15 @@ static void rtable_add_route(struct in_addr srcaddr, in_port_t srcport,
           .resp = resp,
         });
 
-    CF_WARNING("RTABLE Added src %s:%u", inet_ntoa(src.sin_addr), ntohs(src.sin_port));
-    CF_WARNING("RTABLE Added dst %s:%u", inet_ntoa(dst.sin_addr), ntohs(dst.sin_port));
-    CF_WARNING("RTABLE Added resp %s:%u", inet_ntoa(resp.sin_addr), ntohs(resp.sin_port));
+//    CF_WARNING("RTABLE Added src %s:%u", inet_ntoa(src.sin_addr), ntohs(src.sin_port));
+//    CF_WARNING("RTABLE Added dst %s:%u", inet_ntoa(dst.sin_addr), ntohs(dst.sin_port));
+//    CF_WARNING("RTABLE Added resp %s:%u", inet_ntoa(resp.sin_addr), ntohs(resp.sin_port));
   }
   else {
     struct rtable_item * item = ccarray_peek(&rtable, pos);
-    CF_WARNING("rtable_find_resp() already exists for %s:%u", inet_ntoa(src.sin_addr), ntohs(src.sin_port));
-    CF_WARNING("Update src to %s:%u", inet_ntoa(src.sin_addr), ntohs(src.sin_port));
-    CF_WARNING("Update dst to %s:%u", inet_ntoa(dst.sin_addr), ntohs(dst.sin_port));
+//    CF_WARNING("rtable_find_resp() already exists for %s:%u", inet_ntoa(src.sin_addr), ntohs(src.sin_port));
+//    CF_WARNING("Update src to %s:%u", inet_ntoa(src.sin_addr), ntohs(src.sin_port));
+//    CF_WARNING("Update dst to %s:%u", inet_ntoa(dst.sin_addr), ntohs(dst.sin_port));
     item->src = src;
     item->dst = dst;
   }
@@ -424,7 +511,6 @@ static bool parsepkt(void * buf, size_t size, struct ip ** _ip, size_t * _iphsiz
     if ( _pldsize ) {
       ssize_t hdrsize = pkt->ip_hl * 4 + tcp->doff * 4;
       *_pldsize = pktsize > hdrsize ? pktsize - hdrsize : 0;
-      CF_DEBUG("* _pldsize=%zu", *_pldsize);
     }
   }
 
@@ -479,9 +565,9 @@ static ssize_t rdtun(int tunfd, int rawfd)
     return -1;
   }
 
-  CF_DEBUG("\n\n-----------------------------\n"
-      "srcfd=%d dstfd=%d pktsize=%zu",
-      tunfd, rawfd, pktsize);
+//  CF_DEBUG("\n\n-----------------------------\n"
+//      "srcfd=%d dstfd=%d pktsize=%zu",
+//      tunfd, rawfd, pktsize);
 
   if ( !parsepkt(pktbuf, pktsize, &ip, &iphsize, &tcp, &tcphsize, &tcppld, &pldsize) ) {
     CF_NOTICE("PKT not parsed\n");
@@ -489,23 +575,23 @@ static ssize_t rdtun(int tunfd, int rawfd)
   }
 
   if ( !tcp ) {
-    CF_NOTICE("Not a TCP\n");
+    // CF_NOTICE("Not a TCP\n");
     return 0;
   }
 
-  dumppkt2("R", ip, iphsize, tcp, tcphsize, tcppld, pldsize);
+  //dumppkt2("R", ip, iphsize, tcp, tcphsize, tcppld, pldsize);
 
   if ( ip->ip_src.s_addr == g_tcpserver_address.sin_addr.s_addr && tcp->source == g_tcpserver_address.sin_port ) {
 
-    CF_NOTICE("Reply FROM internal server");
+    //CF_NOTICE("Reply FROM internal server");
 
     ssize_t pos = rtable_find_resp(ip->ip_dst, tcp->dest);
     if ( pos < 0 ) {
-      CF_FATAL("rtable_find_dest() fails for dst=%s:%u", inet_ntoa(ip->ip_dst), ntohs(tcp->dest));
+      //CF_FATAL("rtable_find_dest() fails for dst=%s:%u", inet_ntoa(ip->ip_dst), ntohs(tcp->dest));
     }
     else {
       const struct rtable_item * item = ccarray_peek(&rtable, pos);
-      CF_DEBUG("item found!");
+      //CF_DEBUG("item found!");
 
       ip->ip_src.s_addr = item->dst.sin_addr.s_addr;
       tcp->source = item->dst.sin_port;
@@ -515,7 +601,7 @@ static ssize_t rdtun(int tunfd, int rawfd)
   }
   else {
 
-    CF_NOTICE("Redirect TO internal server");
+    //CF_NOTICE("Redirect TO internal server");
 
     struct in_addr resp_addrs = {ip->ip_dst.s_addr};
     in_port_t resp_port = tcp->source;
@@ -533,7 +619,7 @@ static ssize_t rdtun(int tunfd, int rawfd)
   update_ip_checksum(ip);
   update_tcp_checksum(ip);
 
-  dumppkt2("W", ip, iphsize, tcp, tcphsize, tcppld, pldsize);
+  // dumppkt2("W", ip, iphsize, tcp, tcphsize, tcppld, pldsize);
 
   cb = write(tunfd, ip, ntohs(ip->ip_len));
   if ( cb <= 0 ) {
@@ -818,12 +904,21 @@ int main(int argc, char *argv[])
     }
 
     //////////////////////////////////////////////////////////////////////////////////////////////
-//    else if ( strcmp(argv[i], "--ip2") == 0 ) {
-//      if ( ++i >= argc ) {
-//        fprintf(stderr, "Missing argument after %s command line switch\n", argv[i - 1]);
-//      }
-//      strncpy(ifaceip2, argv[i], sizeof(ifaceip2));
-//    }
+    else if ( strcmp(argv[i], "--smaster") == 0 ) {
+      if ( ++i >= argc ) {
+        fprintf(stderr, "Missing argument after %s command line switch\n", argv[i - 1]);
+      }
+
+      char saddrs[256] = "";
+      uint16_t port = 6010;
+
+      if ( sscanf(argv[i], "%255[^:]:%hu", saddrs, &port) < 1 ) {
+        fprintf(stderr, "Invalid argument after %s command line switch\n", argv[i - 1]);
+        return 1;
+      }
+
+      so_sockaddr_in(saddrs, port, &g_master_server_address);
+    }
 
     //////////////////////////////////////////////////////////////////////////////////////////////
     else if ( strcmp(argv[i], "--iface1") == 0 ) {

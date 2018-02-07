@@ -46,6 +46,15 @@ socklen_t so_get_addrlen(const struct sockaddr * addr)
   return 0;
 }
 
+void so_sockaddr_in(const char * addrs, uint16_t port, struct sockaddr_in * sin)
+{
+  memset(sin, 0, sizeof(*sin));
+  sin->sin_family = AF_INET;
+  inet_pton(AF_INET, addrs, &sin->sin_addr);
+  sin->sin_port = htons(port);
+}
+
+
 bool so_set_send_bufsize(int so, int size)
 {
   return setsockopt(so, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size)) == 0;
@@ -174,6 +183,11 @@ bool so_set_keepalive(int so, int keepalive, int keepidle, int keepintvl, int ke
   return true;
 }
 
+bool so_set_ip_hdrincl(int so, bool optval)
+{
+  int val = optval ? 1 : 0;
+  return setsockopt(so, IPPROTO_IP, IP_HDRINCL, &val, sizeof(val)) >= 0;
+}
 
 bool so_get_keepalive(int so, int * keepalive, int * keepidle, int * keepintvl, int * keepcnt)
 {
@@ -233,5 +247,50 @@ bool so_close(int so, bool abort_conn)
   shutdown(so, SHUT_RDWR);
   return close(so) == 0;
 }
+
+int so_tcp_listen(const char * addrs, uint16_t port, struct sockaddr_in * _sin)
+{
+  bool fOk = false;
+  struct sockaddr_in sin;
+  int so = -1;
+
+  if ((so = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)) == -1 ) {
+    // CF_FATAL("socket() fails: %s", strerror(errno));
+    goto __end;
+  }
+
+  so_sockaddr_in(addrs, port, &sin);
+
+  if ( !so_set_reuse_addrs(so, true) ) {
+    // CF_WARNING("so_set_reuse_addrs() fails: %s", strerror(errno));
+  }
+
+  if ( bind(so, (struct sockaddr*)&sin, sizeof(sin)) == -1 ) {
+    //CF_FATAL("bind() fails: %s", strerror(errno));
+    goto __end;
+  }
+
+  if ( listen(so, SOMAXCONN) == -1 ) {
+    // CF_FATAL("listen() fails: %s", strerror(errno));
+    goto __end;
+  }
+
+  if ( _sin ) {
+    *_sin = sin;
+  }
+
+  fOk = true;
+
+__end:
+
+  if ( !fOk ) {
+    if ( so != -1 ) {
+      close(so), so = -1;
+    }
+  }
+
+  return so;
+}
+
 
 

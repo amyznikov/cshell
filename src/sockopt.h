@@ -71,10 +71,18 @@ bool so_set_non_blocking(int so, int optval);
 bool so_set_keepalive(int so, int keepalive, int keepidle, int keepintvl, int keepcnt);
 bool so_get_keepalive(int so, int * keepalive, int * keepidle, int * keepintvl, int * keepcnt);
 
+bool so_set_ip_hdrincl(int so, bool optval);
+
 int so_get_outq_size(int so);
 
 bool so_close(int so, bool abort_conn);
 
+
+void so_sockaddr_in(const char * addrs, uint16_t port,
+    struct sockaddr_in * sin);
+
+int so_tcp_listen(const char * addrs, uint16_t port,
+    struct sockaddr_in * _sin);
 
 
 #ifdef __cplusplus

@@ -5,9 +5,10 @@ VERSION = 0.0.1
 CLIENT = cshell-client
 SERVER = cshell-server
 ROUTER = cshell-router
+TCPTST = raw-tcp-tester
 
 
-all: $(CLIENT) $(SERVER) $(ROUTER)
+all: $(CLIENT) $(SERVER) $(ROUTER) $(TCPTST)
 
 cross=
 DESTDIR=
@@ -40,16 +41,18 @@ LDFLAGS = $(CFLAGS)
 
 
 
-COMMON_SOURCES = src/debug.c  src/sockopt.c
+
+COMMON_SOURCES = src/debug.c  src/sockopt.c src/checksum.c
 
 CLIENT_SOURCES = $(COMMON_SOURCES) src/cshell-client.c
 SERVER_SOURCES = $(COMMON_SOURCES) src/cshell-server.c
 ROUTER_SOURCES = $(COMMON_SOURCES) src/cshell-router.c
-
+TCPTST_SOURCES = $(COMMON_SOURCES) src/raw-tcp-tester.c
 
 CLIENT_MODULES = $(addsuffix .o, $(basename $(CLIENT_SOURCES)))
 SERVER_MODULES = $(addsuffix .o, $(basename $(SERVER_SOURCES))) 
 ROUTER_MODULES = $(addsuffix .o, $(basename $(ROUTER_SOURCES)))
+TCPTST_MODULES = $(addsuffix .o, $(basename $(TCPTST_SOURCES)))
 
 INCLUDES += -Isrc
 
@@ -57,7 +60,7 @@ INCLUDES += -Isrc
 
 
 $(CLIENT): $(CLIENT_MODULES)
-	$(LD) $(LDFLAGS) $(CLIENT_MODULES) -o $@
+	$(LD) $(LDFLAGS) $(CLIENT_MODULES) -pthread -o $@
 
 $(SERVER): $(SERVER_MODULES)
 	$(LD) $(LDFLAGS) $(SERVER_MODULES) -o $@
@@ -65,11 +68,14 @@ $(SERVER): $(SERVER_MODULES)
 $(ROUTER): $(ROUTER_MODULES)
 	$(LD) $(LDFLAGS) $(ROUTER_MODULES) -o $@
 
+$(TCPTST): $(TCPTST_MODULES)
+	$(LD) $(LDFLAGS) $(TCPTST_MODULES) -pthread -o $@
+
 clean:
 	$(RM) src/*.o
 	
 distclean: clean
-	$(RM) $(CLIENT) $(SERVER) $(ROUTER) 
+	$(RM) $(CLIENT) $(SERVER) $(ROUTER) $(TCPTST) 
 
 
 $(mkinstalldirs) : 

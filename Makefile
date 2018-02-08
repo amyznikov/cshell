@@ -42,7 +42,7 @@ LDFLAGS = $(CFLAGS)
 
 
 
-COMMON_SOURCES = src/debug.c  src/sockopt.c 
+COMMON_SOURCES = src/debug.c  src/sockopt.c src/so-msg.c 
 
 CLIENT_SOURCES = $(COMMON_SOURCES) src/cshell-client.c src/tunnel.c src/checksum.c src/ip-pkt.c
 SERVER_SOURCES = $(COMMON_SOURCES) src/cshell-server.c

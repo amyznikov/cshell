@@ -22,13 +22,13 @@
 //#include <netinet/in.h>
 
 
-#include <pthread.h>
-
+#include "pthread_wait.h"
 #include "sockopt.h"
 #include "tunnel.h"
 #include "checksum.h"
 #include "ip-pkt.h"
 #include "epoll-ctl.h"
+#include "so-msg.h"
 #include "ccarray.h"
 #include "debug.h"
 
@@ -39,118 +39,184 @@
 
 static const char VERSION[] = CSHELL_VERSION;
 
+// global socket of master server connection
+static int smaster_so = -1;
+
+
+
 ///////////////////////////////////////////////////////////////////////////////////
 
-static char g_bindaddrs[256];
-struct sockaddr_in g_tcpserver_address;
+//struct sockaddr_in g_master_server_address;
 
-struct sockaddr_in g_master_server_address;
+static int master_authenticate(const char * master_server_ip, uint16_t master_server_port,
+    const char * client_id, /* out */
+    /* out */ char tunip[16])
+{
+  int so = -1;
+  bool fOk = false;
 
+  * tunip = 0;
+
+  if ( (so = so_tcp_connect2(master_server_ip, master_server_port)) == -1 ) {
+    CF_FATAL("so_tcp_connect2(%s:%u) fails: %s", master_server_ip, master_server_port,
+        strerror(errno));
+    goto __end;
+  }
+
+
+  /* proto: client must send his ID in first message line */
+  if ( so_sprintf(so, "%s\n", client_id) < 1 ) {
+    CF_FATAL("so_sprintf(so=%d, client_id='%s') fails: %s", so, client_id, strerror(errno));
+    goto __end;
+  }
+
+
+  /* proto: client expect tunip in auth server responce */
+  if ( so_recv_line(so, tunip, 16) < 1 ) {
+    CF_FATAL("so_recv_line(so=%d, tunip) fails: %s", so, strerror(errno));
+    goto __end;
+  }
+
+
+  fOk = true;
+
+__end:
+
+  if ( !fOk ) {
+    if ( so != -1 ) {
+      so_close(so, false), so = -1;
+    }
+  }
+
+  return so;
+}
+
+
+
+
+
+///////////////////////////////////////////////////////////////////////////////////
+
+//static char g_bindaddrs[256];
+struct sockaddr_in g_microsrv_bind_address;
 
 static void * microsrv_client_thread(void * arg)
 {
   int so1 = (int)(ssize_t)(arg);
-  int so2 = -1;
+//  int so2 = -1;
 
-  CF_DEBUG("Try to connect to smaster %s:%u", inet_ntoa(g_master_server_address.sin_addr), ntohs(g_master_server_address.sin_port));
+//  CF_DEBUG("Try to connect to smaster %s:%u", inet_ntoa(g_master_server_address.sin_addr), ntohs(g_master_server_address.sin_port));
+//
+//  if ( (so2 = so_tcp_connect(&g_master_server_address)) == -1 ) {
+//    CF_FATAL("so_tcp_connect() fails: %s", strerror(errno));
+//
+//    char buf[4096] = "";
+//    ssize_t cb1, cb2;
+//    recv(so1, buf, sizeof(buf) - 1, MSG_DONTWAIT);
+//
+//    char msg[1024] = "HTTP/1.1 200 OK\r\n"
+//        "Content-Type: text/html; charset=ISO-8859-1\r\n"
+//        "\r\n"
+//        "<HTML> Can not connect master server</HTML>\r\n";
+//
+//    send(so1, msg, strlen(msg), 0);
+//    close (so1);
+//  }
+//  else {
+//
+//
+//    static const int MAX_EPOLL_EVENTS = 100;
+//    struct epoll_event events[MAX_EPOLL_EVENTS];
+//    struct epoll_event * e;
+//    int epollfd = -1;
+//    bool fail = false;
+//
+//    char buf[4096] = "";
+//    ssize_t cb1, cb2;
+//    int i, n;
+//
+//
+//    /* create epoll listener */
+//    if ( (epollfd = epoll_create1(0)) == -1 ) {
+//      CF_FATAL("epoll_create1() fails: %s", strerror(errno));
+//    }
+//
+//
+//    /* manage so to listen input packets */
+//    if ( !epoll_add(epollfd, so1, EPOLLIN) ) {
+//      CF_FATAL("epoll_(epollfd=%d, so1=%d) fails: %s", epollfd, so1, strerror(errno));
+//    }
+//    if ( !epoll_add(epollfd, so2, EPOLLIN) ) {
+//      CF_FATAL("epoll_(epollfd=%d, so2=%d) fails: %s", epollfd, so2, strerror(errno));
+//    }
+//
+//
+//    CF_DEBUG("so1 = %d", so1);
+//    CF_DEBUG("so2 = %d", so2);
+//
+//    while ( (n = epoll_wait(epollfd, events, MAX_EPOLL_EVENTS, -1)) >= 0 && !fail ) {
+//
+//      CF_DEBUG("epoll: n=%d", n);
+//
+//      for ( i = 0; i < n; ++i ) {
+//
+//        e = &events[i];
+//
+//        CF_DEBUG("epoll: events[i=%d] = 0x%0X fd=%d", i, e->events, e->data.fd);
+//
+//        if ( e->events & EPOLLIN ) {
+//
+//          if ( e->data.fd == so1 ) {
+//            if ( (cb1 = recv(so1, buf, sizeof(buf), 0)) <= 0 ) {
+//              CF_FATAL("recv(so1) fails: %s", strerror(errno));
+//              fail = true;
+//              break;
+//            }
+//
+//            if ( (cb2 = send(so2, buf, cb1, 0)) != cb1 ) {
+//              CF_FATAL("send(so2) fails: %s", strerror(errno));
+//              fail = true;
+//              break;
+//            }
+//          }
+//          else if ( e->data.fd == so2 ) {
+//            if ( (cb2 = recv(so2, buf, sizeof(buf), 0)) <= 0 ) {
+//              CF_FATAL("recv(so2) fails: %s", strerror(errno));
+//              fail = true;
+//              break;
+//            }
+//
+//            if ( (cb1 = send(so1, buf, cb2, 0)) != cb2 ) {
+//              CF_FATAL("send(so1) fails: %s", strerror(errno));
+//              fail = true;
+//              break;
+//            }
+//          }
+//        }
+//      }
+//    }
+//
+//    CF_DEBUG("\n==========================\n");
+//    close(so1);
+//    close(so2);
+//    close(epollfd);
+//    CF_DEBUG("CONNECTIONS CLOSED");
+//    CF_DEBUG("\n==========================\n");
+//  }
 
-  if ( (so2 = so_tcp_connect(&g_master_server_address)) == -1 ) {
-    CF_FATAL("so_tcp_connect() fails: %s", strerror(errno));
+  {
 
     char buf[4096] = "";
-    ssize_t cb1, cb2;
+//    ssize_t cb1, cb2;
     recv(so1, buf, sizeof(buf) - 1, MSG_DONTWAIT);
 
     char msg[1024] = "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/html; charset=ISO-8859-1\r\n"
         "\r\n"
-        "<HTML> Can not connect master server</HTML>\r\n";
+        "<HTML> DUMMY TEST</HTML>\r\n";
 
     send(so1, msg, strlen(msg), 0);
-    close (so1);
   }
-  else {
-
-
-    static const int MAX_EPOLL_EVENTS = 100;
-    struct epoll_event events[MAX_EPOLL_EVENTS];
-    struct epoll_event * e;
-    int epollfd = -1;
-    bool fail = false;
-
-    char buf[4096] = "";
-    ssize_t cb1, cb2;
-    int i, n;
-
-
-    /* create epoll listener */
-    if ( (epollfd = epoll_create1(0)) == -1 ) {
-      CF_FATAL("epoll_create1() fails: %s", strerror(errno));
-    }
-
-
-    /* manage so to listen input packets */
-    if ( !epoll_add(epollfd, so1, EPOLLIN) ) {
-      CF_FATAL("epoll_(epollfd=%d, so1=%d) fails: %s", epollfd, so1, strerror(errno));
-    }
-    if ( !epoll_add(epollfd, so2, EPOLLIN) ) {
-      CF_FATAL("epoll_(epollfd=%d, so2=%d) fails: %s", epollfd, so2, strerror(errno));
-    }
-
-
-    CF_DEBUG("so1 = %d", so1);
-    CF_DEBUG("so2 = %d", so2);
-
-    while ( (n = epoll_wait(epollfd, events, MAX_EPOLL_EVENTS, -1)) >= 0 && !fail ) {
-
-      CF_DEBUG("epoll: n=%d", n);
-
-      for ( i = 0; i < n; ++i ) {
-
-        e = &events[i];
-
-        CF_DEBUG("epoll: events[i=%d] = 0x%0X fd=%d", i, e->events, e->data.fd);
-
-        if ( e->events & EPOLLIN ) {
-
-          if ( e->data.fd == so1 ) {
-            if ( (cb1 = recv(so1, buf, sizeof(buf), 0)) <= 0 ) {
-              CF_FATAL("recv(so1) fails: %s", strerror(errno));
-              fail = true;
-              break;
-            }
-
-            if ( (cb2 = send(so2, buf, cb1, 0)) != cb1 ) {
-              CF_FATAL("send(so2) fails: %s", strerror(errno));
-              fail = true;
-              break;
-            }
-          }
-          else if ( e->data.fd == so2 ) {
-            if ( (cb2 = recv(so2, buf, sizeof(buf), 0)) <= 0 ) {
-              CF_FATAL("recv(so2) fails: %s", strerror(errno));
-              fail = true;
-              break;
-            }
-
-            if ( (cb1 = send(so1, buf, cb2, 0)) != cb2 ) {
-              CF_FATAL("send(so1) fails: %s", strerror(errno));
-              fail = true;
-              break;
-            }
-          }
-        }
-      }
-    }
-
-    CF_DEBUG("\n==========================\n");
-    close(so1);
-    close(so2);
-    close(epollfd);
-    CF_DEBUG("CONNECTIONS CLOSED");
-    CF_DEBUG("\n==========================\n");
-  }
-
 
   pthread_detach(pthread_self());
   return NULL;
@@ -158,51 +224,53 @@ static void * microsrv_client_thread(void * arg)
 
 static void * mircosrv_thread(void * arg)
 {
+  pthread_t pid;
+  int so1, so2;
+
   struct sockaddr_in addrsfrom;
   socklen_t addrslen = sizeof(addrsfrom);
 
-  int so1, so2;
   int status;
 
   pthread_detach(pthread_self());
 
-  if ( (so1 = so_tcp_listen(g_bindaddrs, 6001, &g_tcpserver_address)) == -1 ) { // 10.10.100.1
-    CF_FATAL("tcp_listen() fails");
-    return NULL;
-  }
+  so1 = (int) (ssize_t) (arg);
 
   while ( (so2 = accept(so1, (struct sockaddr*) &addrsfrom, &addrslen)) != -1 ) {
 
-    CF_CRITICAL("ACCEPTED FROM %s:%u", inet_ntoa(addrsfrom.sin_addr), ntohs(addrsfrom.sin_port));
+    CF_NOTICE("ACCEPTED FROM %s:%u", inet_ntoa(addrsfrom.sin_addr), ntohs(addrsfrom.sin_port));
 
-    pthread_t pid;
-    status = pthread_create(&pid, NULL, microsrv_client_thread, (void*)(ssize_t)(so2));
-    if ( status ) {
+    if ( (status = pthread_create(&pid, NULL, microsrv_client_thread, (void*)(ssize_t)(so2))) ) {
       CF_FATAL("pthread_create() fails: %s", strerror(status));
+      close(so2);
     }
   }
 
   CF_CRITICAL("accept() fails!");
 
+  close(so1);
+
   return NULL;
 }
-
-
-
 
 static bool start_mircosrv_thread(const char * bindaddrs)
 {
   pthread_t pid;
+  int so = -1;
   int status;
 
-  strcpy(g_bindaddrs, bindaddrs);
-
-  status = pthread_create(&pid, NULL, mircosrv_thread, NULL);
-  if ( status ) {
-    CF_FATAL("pthread_create() fauls: %s", strerror(status));
+  if ( (so = so_tcp_listen(bindaddrs, 6001, &g_microsrv_bind_address)) == -1 ) { // 10.10.100.1
+    CF_FATAL("so_tcp_listen(bindaddrs=%s:6001) fails", bindaddrs);
+    return false;
   }
 
-  return status == 0;
+  if ( (status = pthread_create(&pid, NULL, mircosrv_thread, (void*) (ssize_t) (so))) ) {
+    CF_FATAL("pthread_create() fauls: %s", strerror(status));
+    close(so);
+    return false;
+  }
+
+  return true;
 }
 
 
@@ -307,7 +375,7 @@ static ssize_t rdtun(int tunfd)
 
   //dumppkt("R", ip, iphsize, tcp, tcphsize, tcppld, pldsize);
 
-  if ( ip->ip_src.s_addr == g_tcpserver_address.sin_addr.s_addr && tcp->source == g_tcpserver_address.sin_port ) {
+  if ( ip->ip_src.s_addr == g_microsrv_bind_address.sin_addr.s_addr && tcp->source == g_microsrv_bind_address.sin_port ) {
 
     //CF_NOTICE("Reply FROM internal server");
 
@@ -337,8 +405,8 @@ static ssize_t rdtun(int tunfd)
     ip->ip_src.s_addr = ip->ip_dst.s_addr;
     // tcp->source = tcp->dest;
 
-    ip->ip_dst.s_addr = g_tcpserver_address.sin_addr.s_addr;
-    tcp->dest = g_tcpserver_address.sin_port;
+    ip->ip_dst.s_addr = g_microsrv_bind_address.sin_addr.s_addr;
+    tcp->dest = g_microsrv_bind_address.sin_port;
   }
 
 
@@ -415,15 +483,8 @@ __end:
 int main(int argc, char *argv[])
 {
 
-  static const char node[] = "/dev/net/tun";
-  char iface1[256] = ""; /* network interface name, will auto generated */
-  int tunfd1 = -1;
-
-//  char iface2[256] = ""; /* network interface name, will auto generated */
-//  int tunfd2 = -1;
-
-//  int tcpfd = -1;
-  char tbind[256] = "10.10.100.1";
+////  int tcpfd = -1;
+//  char tbind[256] = "10.10.100.1";
 
 
 
@@ -431,14 +492,29 @@ int main(int argc, char *argv[])
   bool daemon_mode = true;
 
 
-  /* ip address assigned to tun interface */
-  char ifaceip1[IFNAMSIZ] = "";
-  char ifacemask1[IFNAMSIZ] = "255.255.255.0";
-  int ifaceflags1 = IFF_UP | IFF_RUNNING | IFF_MULTICAST | IFF_NOARP;// | IFF_POINTOPOINT;// | IFF_MULTICAST | IFF_NOARP;
+  // id of this client, must be registered on master server
+  char client_id[256] = "";
 
-//  char ifaceip2[IFNAMSIZ] = "";
-//  char ifacemask2[IFNAMSIZ] = "255.255.255.0";
-//  int ifaceflags2 = IFF_UP | IFF_RUNNING | IFF_MULTICAST | IFF_NOARP;// | IFF_POINTOPOINT; // | IFF_MULTICAST | IFF_NOARP;
+  /* ip address assigned to tun interface, sent by master server after succesfull authentication */
+  char tunip[64] = "";
+
+  /* net mask for tun interface, temporary fixed in this code */
+  char ifacemask[IFNAMSIZ] = "255.255.255.0";
+
+  /* flags for tun interface, temporary fixed in this code */
+  int ifaceflags = IFF_UP | IFF_RUNNING | IFF_MULTICAST | IFF_NOARP;// | IFF_POINTOPOINT;// | IFF_MULTICAST | IFF_NOARP;
+
+  /* network interface name assigned to tunnel, may be provided by command line or auto generated */
+  char tuniface[256] = "";
+
+  /* tun device and file descriptor */
+  static const char node[] = "/dev/net/tun";
+  int tunfd = -1;
+
+
+  char master_server_ip[256] = "";
+  uint16_t master_server_port = 6010;
+
 
   int i;
 
@@ -455,14 +531,14 @@ int main(int argc, char *argv[])
       printf("OPTIONS:\n");
       printf(" --no-daemon, -n\n");
       printf("      don't fork, run in foreground mode\n");
-      printf(" --ip1 IPv4\n");
-      printf("      temporary debug test to assing IP address for tun dev\n");
-      printf(" --ip2 IPv4\n");
-      printf("      temporary debug test to assing IP address for tun dev\n");
-      printf(" --iface1 <iface-name 1>\n");
-      printf("      temporary debug test to assing IP address for tun dev\n");
-      printf(" --iface2 <iface-name 2>\n");
-      printf("      temporary debug test to assing IP address for tun dev\n");
+      printf(" --cid\n");
+      printf("      this client id\n");
+      printf(" --smaster <ip:port>\n");
+      printf("      ip:port of master server\n");
+      printf(" --iface <tun-interface-name>\n");
+      printf("      optional name of tunnel interface, will auto generated if not specified\n");
+
+
       return 0;
     }
 
@@ -473,50 +549,34 @@ int main(int argc, char *argv[])
     }
 
     //////////////////////////////////////////////////////////////////////////////////////////////
-    else if ( strcmp(argv[i], "--ip1") == 0 ) {
+    else if ( strcmp(argv[i], "--cid") == 0 ) {
       if ( ++i >= argc ) {
         fprintf(stderr, "Missing argument after %s command line switch\n", argv[i - 1]);
+        return 1;
       }
-      strncpy(ifaceip1, argv[i], sizeof(ifaceip1));
+      strncpy(client_id, argv[i], sizeof(client_id) - 1);
     }
 
     //////////////////////////////////////////////////////////////////////////////////////////////
     else if ( strcmp(argv[i], "--smaster") == 0 ) {
       if ( ++i >= argc ) {
         fprintf(stderr, "Missing argument after %s command line switch\n", argv[i - 1]);
-      }
-
-      char saddrs[256] = "";
-      uint16_t port = 6010;
-
-      if ( sscanf(argv[i], "%255[^:]:%hu", saddrs, &port) < 1 ) {
-        fprintf(stderr, "Invalid argument after %s command line switch\n", argv[i - 1]);
         return 1;
       }
 
-      so_sockaddr_in(saddrs, port, &g_master_server_address);
+      if ( sscanf(argv[i], "%255[^:]:%hu", master_server_ip, &master_server_port) < 1 ) {
+        fprintf(stderr, "Invalid argument after %s command line switch\n", argv[i - 1]);
+        return 1;
+      }
     }
 
     //////////////////////////////////////////////////////////////////////////////////////////////
-    else if ( strcmp(argv[i], "--iface1") == 0 ) {
+    else if ( strcmp(argv[i], "--iface") == 0 ) {
       if ( ++i >= argc ) {
         fprintf(stderr, "Missing argument after %s command line switch\n", argv[i - 1]);
+        return 1;
       }
-      strncpy(iface1, argv[i], sizeof(iface1));
-    }
-
-//    else if ( strcmp(argv[i], "--iface2") == 0 ) {
-//      if ( ++i >= argc ) {
-//        fprintf(stderr, "Missing argument after %s command line switch\n", argv[i - 1]);
-//      }
-//      strncpy(iface2, argv[i], sizeof(iface1));
-//    }
-
-    else if ( strcmp(argv[i], "--tbind") == 0 ) {
-      if ( ++i >= argc ) {
-        fprintf(stderr, "Missing argument after %s command line switch\n", argv[i - 1]);
-      }
-      strncpy(tbind, argv[i], sizeof(tbind));
+      strncpy(tuniface, argv[i], sizeof(tuniface) - 1);
     }
 
     //////////////////////////////////////////////////////////////////////////////////////////////
@@ -526,9 +586,32 @@ int main(int argc, char *argv[])
     }
   }
 
+  cf_set_logfilename("stderr");
+  cf_set_loglevel(CF_LOG_DEBUG);
 
 
 
+  CF_DEBUG("master_authenticate(master_server=%s:%u, client_id=%s)",
+      master_server_ip, master_server_port, client_id);
+
+  smaster_so = master_authenticate(master_server_ip, master_server_port, client_id, tunip);
+  if ( smaster_so == -1 ) {
+    CF_FATAL("master_authenticate() fails: %s", strerror(errno));
+    return 1;
+  }
+
+
+
+
+  CF_DEBUG("open_tunnel(node=%s, tuniface=%s, tunip=%s, ifacemask=%s, ifaceflags=0x%0X)",
+      node, tuniface, tunip, ifacemask, ifaceflags);
+
+  if ( (tunfd = open_tunnel(node, tuniface, tunip, ifacemask, ifaceflags)) == -1 ) {
+    CF_FATAL("open_tunnel(node=%s, tuniface=%s, tunip=%s, ifacemask=%s, ifaceflags=0x%0X) fails: %s",
+        node, tuniface, tunip, ifacemask, ifaceflags, strerror(errno));
+    so_close(smaster_so, false);
+    return 1;
+  }
 
 
   /* fork() and become daemon */
@@ -551,53 +634,23 @@ int main(int argc, char *argv[])
       fprintf(stderr, "switched to background mode: pid=%d\n", pid);
       return 0;
     }
-  }
 
-
-
-
-  /* setup debug stuff */
-  if ( daemon_mode ) {
     cf_set_logfilename("cshell-client.log");
   }
-  else {
-    cf_set_logfilename("stderr");
-  }
 
-  cf_set_loglevel(CF_LOG_DEBUG);
 
 
   ccarray_init(&rtable, 1024, sizeof(struct rtable_item));
 
 
-
-  /* open tunnel device */
-  if ( (tunfd1 = open_tunnel_device(node, iface1, IFF_TUN | IFF_NO_PI)) < 0 ) {
-    CF_FATAL("create_tunnel('%s') fails: %s", node, strerror(errno));
-    return 1;
-  }
-  /* assign IP to tun interface */
-  if ( *ifaceip1 && !set_tunnel_ip(iface1, ifaceip1, ifacemask1) ) {
-    CF_FATAL("set_tunnel_ip(iface=%s, ip=%s, mask=%s) fails: %s", iface1, ifaceip1, ifacemask1, strerror(errno));
-    return 1;
-  }
-  /* activate interface */
-  if ( !set_tunnel_flags(iface1, ifaceflags1) ) {
-    CF_FATAL("set_tunnel_flags(iface=%s, ifaceflags=0x%0X) fails: %s", iface1, ifaceflags1, strerror(errno));
-    return 1;
-  }
-
-
-  start_mircosrv_thread(tbind);
+  start_mircosrv_thread(tunip);
   sleep(1);
 
-  CF_DEBUG("iface1='%s'", iface1);
-  CF_DEBUG("listening %s:%u", inet_ntoa(g_tcpserver_address.sin_addr), ntohs(g_tcpserver_address.sin_port));
+  CF_DEBUG("listening %s:%u", inet_ntoa(g_microsrv_bind_address.sin_addr), ntohs(g_microsrv_bind_address.sin_port));
 
 
   /* run event loop */
-  process_tunnel_packets(tunfd1);
-
+  process_tunnel_packets(tunfd);
 
 
   return 0;

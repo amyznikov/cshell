@@ -14,7 +14,7 @@
 
 #include "pthread_wait.h"
 #include "sockopt.h"
-#include "checksum.h"
+#include "so-msg.h"
 #include "ccarray.h"
 #include "debug.h"
 
@@ -30,17 +30,21 @@ static const char VERSION[] = CSHELL_VERSION;
 #define MAX_TUN_IP    16
 #define MAX_CLIENTS   256
 
-// personal client inventory
+
+// Personal client inventory
 struct client_account {
   char  id[MAX_CLIENT_ID];
   char  tunip[MAX_TUN_IP];
 };
 
+// Global list (aka database) of registerd client accounts
 static ccarray_t g_client_accounts; // <struct client_account>
 
 
 
-// actual connections from clients
+
+
+// Actual connections from clients
 struct client_connection {
   char  id[MAX_CLIENT_ID];
   char  tunip[MAX_TUN_IP];
@@ -49,7 +53,6 @@ struct client_connection {
 
 #define MAX_CLIENT_CONNECTIONS \
     (ccarray_size(&g_client_accounts))
-
 
 static ccarray_t g_client_connections;
 static pthread_wait_t g_client_connections_lock;
@@ -161,66 +164,6 @@ static struct client_connection * get_client_connection(const char * cid)
   return pos < 0 ? NULL : ccarray_ppeek(&g_client_connections, pos);
 }
 
-
-/*
- * Receive single line from socket
- *  fixme : performance issues!!!!
- */
-static ssize_t so_recv_line(int so, char buf[/*maxsize*/], size_t maxsize)
-{
-  size_t n = 0;
-  ssize_t c;
-
-  while ( n < maxsize - 1 && (c = recv(so, &buf[n], 1, 0)) == 1 ) {
-    if ( buf[n++] == '\n' ) {
-      break;
-    }
-  }
-
-  buf[n] = 0;
-  return c < 0 ? -1 : (ssize_t)n;
-}
-
-
-/**
- * Encrypt the message using symmetric key, generate and append the RSA signature using server's private RSA key,
- * and send the encrypted and signed message to cudp socket,
- *
- * @return      count of bytes sent, -1 on error
- * attributes are not allowed on a function-definition, so, provide prototype here
- */
-static int so_sprintf(int so, const char * text, ...) \
-    __attribute__ ((__format__ (__printf__, 2, 3)));
-
-static int so_sprintf(int so, const char * format, ...)
-{
-  va_list arglist;
-  char * msg = NULL;
-  ssize_t cb;
-  int n;
-
-  /* sprintf() message into temporary memory buffer */
-  va_start(arglist, format);
-  if ( (n = vasprintf(&msg, format, arglist)) < 0 ) {
-    CF_FATAL("[%d] FATAL: vasprintf() fails: %s", so, strerror(errno));
-  }
-  va_end(arglist);
-
-  if ( n > 0 && (cb = send(so, msg, n, 0)) != n ) {
-    CF_FATAL("[%d] FATAL: send() fails: %s", so, strerror(errno));
-  }
-
-  /* Free malloc()-ed memory */
-  free(msg);
-
-  return cb;
-}
-
-
-
-
-
-
 static struct client_connection * authenticate_connection(int so )
 {
   // client id
@@ -235,7 +178,7 @@ static struct client_connection * authenticate_connection(int so )
   bool fOk = false;
 
   /* proto: client must send his ID in first message line */
-  if ( (cb = so_recv_line(so, cid, sizeof(cid))) ) {
+  if ( (cb = so_recv_line(so, cid, sizeof(cid))) < 1 ) {
     CF_FATAL("so=%d] so_recv_line() fails", so);
     goto __end;
   }
@@ -275,7 +218,7 @@ static struct client_connection * authenticate_connection(int so )
 
   client_connections_unlock();
 
-  // proto: client expect tunip in auth server responce
+  /* proto: client expect tunip in auth server responce */
   if ( (cb = so_sprintf(so, "%s\n", cc->tunip)) <= 0 ) {
 
     CF_FATAL("[so=%d][%s] FATAL: so_sprintf(tunip) fails. ABORTING CONNECTION.", so, cid);

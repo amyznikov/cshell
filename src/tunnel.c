@@ -148,5 +148,43 @@ bool set_tunnel_flags(const char * iface, int flags)
   return fOk;
 }
 
+int open_tunnel(const char * node, char iface[], const char * ifaceip, const char * ifacemask, int ifaceflags)
+{
+  int tunfd = -1;
+  bool fOk = false;
+
+  /* open tunnel device */
+  if ( (tunfd = open_tunnel_device(node, iface, IFF_TUN | IFF_NO_PI)) < 0 ) {
+    CF_FATAL("open_tunnel_device('%s') fails: %s", node, strerror(errno));
+    goto __end;
+  }
+
+  /* assign IP to tun interface */
+  if ( (ifaceip && *ifaceip) || (ifacemask && *ifacemask) ) {
+    if ( !set_tunnel_ip(iface, ifaceip, ifacemask) ) {
+      CF_FATAL("set_tunnel_ip(iface=%s, ip=%s, mask=%s) fails: %s", iface, ifaceip, ifacemask, strerror(errno));
+      goto __end;
+    }
+  }
+
+
+  /* activate interface */
+  if ( ifaceflags && !set_tunnel_flags(iface, ifaceflags) ) {
+    CF_FATAL("set_tunnel_flags(iface=%s, ifaceflags=0x%0X) fails: %s", iface, ifaceflags, strerror(errno));
+    goto __end;
+  }
+
+  fOk = true;
+
+__end:
+
+  if ( !fOk ) {
+    if ( tunfd != -1 ) {
+      close(tunfd), tunfd = -1;
+    }
+  }
+
+  return tunfd;
+}
 
 

@@ -319,4 +319,10 @@ __end:
   return so;
 }
 
+int so_tcp_connect2(const char * addrs, uint16_t port)
+{
+  struct sockaddr_in sin;
+  so_sockaddr_in(addrs, port, &sin);
+  return so_tcp_connect(&sin);
+}
 

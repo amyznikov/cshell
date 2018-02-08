@@ -49,6 +49,11 @@ bool set_tunnel_flags(const char * iface, int flags);
 
 
 
+/**************************************************************************
+ *
+ */
+int open_tunnel(const char * node, char iface[], const char * ifaceip, const char * ifacemask, int ifaceflags);
+
 #ifdef __cplusplus
 }
 #endif

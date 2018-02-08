@@ -85,6 +85,7 @@ int so_tcp_listen(const char * addrs, uint16_t port,
     struct sockaddr_in * _sin);
 
 int so_tcp_connect(struct sockaddr_in * addrs);
+int so_tcp_connect2(const char * addrs, uint16_t port);
 
 #ifdef __cplusplus
 }

@@ -21,6 +21,7 @@
 //#include <linux/if_tun.h>
 //#include <netinet/in.h>
 
+#include <sys/eventfd.h>
 
 #include "pthread_wait.h"
 #include "sockopt.h"
@@ -40,7 +41,73 @@
 static const char VERSION[] = CSHELL_VERSION;
 
 // global socket of master server connection
-static int smaster_so = -1;
+//static int smaster_so = -1;
+
+
+///////////////////////////////////////////////////////////////////////////////////
+
+#define MAX_RESOURCE_ID 256
+#define MAX_SMASTER_REQUESTS_QUEUE_SIZE 1000
+
+struct route_request {
+  int so;
+  struct sockaddr_in resource;
+};
+
+static ccarray_t smaster_queue; // <struct route_request>
+static int smaster_queue_eventfd = -1;
+static pthread_wait_t smaster_queue_lock = PTHREAD_WAIT_INITIALIZER;
+
+
+
+static bool init_smaster_queue(void)
+{
+  if ( !ccarray_init(&smaster_queue, MAX_SMASTER_REQUESTS_QUEUE_SIZE, sizeof(struct route_request)) ) {
+    CF_FATAL("ccarray_init(smaster_requests_queue) fails: %s ", strerror(errno));
+    return false;
+  }
+
+  if ( (smaster_queue_eventfd = eventfd(0, 0)) == -1 ) {
+    CF_FATAL("ccarray_init(smaster_requests_queue) fails: %s ", strerror(errno));
+    return false;
+  }
+
+  CF_DEBUG("smaster_queue_eventfd=%d", smaster_queue_eventfd);
+
+  return true;
+}
+
+
+static bool smaster_queue_push_request(int so, const struct sockaddr_in * resource)
+{
+  bool fOk = false;
+
+  pthread_wait_lock(&smaster_queue_lock);
+
+  if ( ccarray_size(&smaster_queue) >= ccarray_capacity(&smaster_queue) ) {
+    CF_FATAL("smnaster queue overflow");
+  }
+  else {
+
+    ccarray_push_back(&smaster_queue, &(struct route_request ) {
+          . so = so,
+          . resource = *resource
+        });
+
+    eventfd_write(smaster_queue_eventfd, 1);
+    CF_DEBUG("eventfd_write() done");
+
+    fOk = true;
+  }
+
+  pthread_wait_unlock(&smaster_queue_lock);
+
+  return fOk;
+}
+
+
+
+
 
 
 
@@ -49,8 +116,7 @@ static int smaster_so = -1;
 //struct sockaddr_in g_master_server_address;
 
 static int master_authenticate(const char * master_server_ip, uint16_t master_server_port,
-    const char * client_id, /* out */
-    /* out */ char tunip[16])
+    const char * client_id,  /* out */ char tunip[IFNAMSIZ])
 {
   int so = -1;
   bool fOk = false;
@@ -92,6 +158,69 @@ __end:
 }
 
 
+/////////////////////////////////////////////////////////////////////////////
+
+/////////////////////////////////////////////////////////////////////////////
+
+
+struct rtable_item {
+  struct sockaddr_in src, dst, resp;
+};
+static ccarray_t rtable; /* <struct rtable_item> */
+
+static ssize_t rtable_find_resp(struct in_addr respaddr, in_port_t respport)
+{
+  size_t i, n;
+  for ( i = 0, n = ccarray_size(&rtable); i < n; ++i ) {
+    struct rtable_item * item = ccarray_peek(&rtable, i);
+    if ( item->resp.sin_addr.s_addr == respaddr.s_addr && item->resp.sin_port == respport ) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+static void rtable_add_route(struct in_addr srcaddr, in_port_t srcport,
+    struct in_addr dstaddr, in_port_t dstport,
+    struct in_addr respaddr, in_port_t respport )
+{
+  struct sockaddr_in src, dst, resp;
+  memset(&src, 0, sizeof(src));
+  memset(&dst, 0, sizeof(dst));
+  memset(&resp, 0, sizeof(resp));
+
+  src.sin_addr = srcaddr;
+  src.sin_port = srcport;
+
+  dst.sin_addr = dstaddr;
+  dst.sin_port = dstport;
+
+  resp.sin_addr = respaddr;
+  resp.sin_port = respport;
+
+  ssize_t pos = rtable_find_resp(resp.sin_addr, resp.sin_port);
+  if ( pos < 0 ) {
+    CF_WARNING("rtable_find_resp() fails for %s:%u", inet_ntoa(resp.sin_addr), ntohs(resp.sin_port));
+    ccarray_push_back(&rtable, &(struct rtable_item ) {
+          .src = src,
+          .dst = dst,
+          .resp = resp,
+        });
+
+//    CF_WARNING("RTABLE Added src %s:%u", inet_ntoa(src.sin_addr), ntohs(src.sin_port));
+//    CF_WARNING("RTABLE Added dst %s:%u", inet_ntoa(dst.sin_addr), ntohs(dst.sin_port));
+//    CF_WARNING("RTABLE Added resp %s:%u", inet_ntoa(resp.sin_addr), ntohs(resp.sin_port));
+  }
+  else {
+    struct rtable_item * item = ccarray_peek(&rtable, pos);
+//    CF_WARNING("rtable_find_resp() already exists for %s:%u", inet_ntoa(src.sin_addr), ntohs(src.sin_port));
+//    CF_WARNING("Update src to %s:%u", inet_ntoa(src.sin_addr), ntohs(src.sin_port));
+//    CF_WARNING("Update dst to %s:%u", inet_ntoa(dst.sin_addr), ntohs(dst.sin_port));
+    item->src = src;
+    item->dst = dst;
+  }
+}
+
 
 
 
@@ -103,6 +232,12 @@ struct sockaddr_in g_microsrv_bind_address;
 static void * microsrv_client_thread(void * arg)
 {
   int so1 = (int)(ssize_t)(arg);
+
+//  so_sprintf(master_so, "RR 10.10.100.50:80\n");
+//  so_recv_line(master_so, buf, maxsize);
+
+
+
 //  int so2 = -1;
 
 //  CF_DEBUG("Try to connect to smaster %s:%u", inet_ntoa(g_master_server_address.sin_addr), ntohs(g_master_server_address.sin_port));
@@ -240,9 +375,22 @@ static void * mircosrv_thread(void * arg)
 
     CF_NOTICE("ACCEPTED FROM %s:%u", inet_ntoa(addrsfrom.sin_addr), ntohs(addrsfrom.sin_port));
 
-    if ( (status = pthread_create(&pid, NULL, microsrv_client_thread, (void*)(ssize_t)(so2))) ) {
-      CF_FATAL("pthread_create() fails: %s", strerror(status));
-      close(so2);
+    ssize_t pos = rtable_find_resp(addrsfrom.sin_addr, addrsfrom.sin_port);
+    if ( pos < 0 ) {
+      CF_FATAL("APP BUG: rtable_find_resp() fails");
+      so_close(so2, false);
+    }
+    else {
+      const struct rtable_item * item = ccarray_peek(&rtable, pos);
+      CF_DEBUG("REQUESTED ROUTE TO %s:%u", inet_ntoa(item->dst.sin_addr), ntohs(item->dst.sin_port));
+
+      if ( !smaster_queue_push_request(so2, &item->dst) ) {
+        CF_FATAL("FATAL: smaster_queue_push_request() fails");
+        so_close(so2, false);
+      }
+      else {
+        CF_DEBUG("so=%d REQUEST QUEUED AS %s:%u", so2, inet_ntoa(item->dst.sin_addr), ntohs(item->dst.sin_port));
+      }
     }
   }
 
@@ -276,64 +424,108 @@ static bool start_mircosrv_thread(const char * bindaddrs)
 
 /////////////////////////////////////////////////////////////////////////////
 
-
-struct rtable_item {
-  struct sockaddr_in src, dst, resp;
-};
-static ccarray_t rtable; /* <struct rtable_item> */
-
-static ssize_t rtable_find_resp(struct in_addr respaddr, in_port_t respport)
+static void * smaster_msgloop_thread( void * arg)
 {
-  size_t i, n;
-  for ( i = 0, n = ccarray_size(&rtable); i < n; ++i ) {
-    struct rtable_item * item = ccarray_peek(&rtable, i);
-    if ( item->resp.sin_addr.s_addr == respaddr.s_addr && item->resp.sin_port == respport ) {
-      return i;
+  int smaster_so = (int)(ssize_t)(arg);
+
+  static const int MAX_EPOLL_EVENTS = 100;
+  struct epoll_event events[MAX_EPOLL_EVENTS];
+  struct epoll_event * e;
+  int epollfd = -1;
+
+  int i, n;
+  bool fail = false;
+
+  pthread_detach(pthread_self());
+
+
+  /* create epoll listener */
+  if ( (epollfd = epoll_create1(0)) == -1 ) {
+    CF_FATAL("epoll_create1() fails: %s", strerror(errno));
+    goto __end;
+  }
+
+  /* manage tunfd to listen input packets */
+  if ( !epoll_add(epollfd, smaster_so, EPOLLIN) ) {
+    CF_FATAL("epoll_(epollfd=%d, smaster_so=%d) fails: %s", epollfd, smaster_so, strerror(errno));
+    goto __end;
+  }
+
+  /* manage smaster_queue_eventfd to listen input events */
+  if ( !epoll_add(epollfd, smaster_queue_eventfd, EPOLLIN) ) {
+    CF_FATAL("epoll_(epollfd=%d, smaster_queue_eventfd=%d) fails: %s", epollfd, smaster_queue_eventfd, strerror(errno));
+    goto __end;
+  }
+
+  // fixme: may be ignore errno == EINTR ?
+  while ( (n = epoll_wait(epollfd, events, MAX_EPOLL_EVENTS, -1)) >= 0 && !fail ) {
+
+    for ( i = 0; i < n ; ++i ) {
+
+      e = &events[i];
+
+      if ( e->data.fd == smaster_so ) {
+        if ( e->events & EPOLLIN ) {
+          // fixme: data from master
+        }
+      }
+      else if ( e->data.fd == smaster_queue_eventfd ) {
+
+        if ( e->events & EPOLLIN ) {
+
+          struct route_request rr;
+          eventfd_t v = 0;
+
+          pthread_wait_lock(&smaster_queue_lock);
+
+          eventfd_read(smaster_queue_eventfd, &v);
+          ccarray_pop_back(&smaster_queue, &rr);
+
+          pthread_wait_unlock(&smaster_queue_lock);
+
+          CF_NOTICE("QUEUE TRIGGERED: v=%llu rr.so=%d resource=%s:%u", (unsigned long long)v, rr.so, inet_ntoa(rr.resource.sin_addr), ntohs(rr.resource.sin_port) );
+
+          // make server transaction
+          {
+
+
+          }
+
+          ///////////////////////////////////
+
+        }
+      }
+
     }
   }
-  return -1;
+
+__end:
+
+  if ( epollfd != -1 ) {
+    close(epollfd);
+  }
+
+  if ( smaster_so != -1 ) {
+    close (smaster_so);
+  }
+
+  return NULL;
 }
 
-static void rtable_add_route(struct in_addr srcaddr, in_port_t srcport,
-    struct in_addr dstaddr, in_port_t dstport,
-    struct in_addr respaddr, in_port_t respport )
+
+
+static bool start_smaster_msgloop(int smaster_so)
 {
-  struct sockaddr_in src, dst, resp;
-  memset(&src, 0, sizeof(src));
-  memset(&dst, 0, sizeof(dst));
-  memset(&resp, 0, sizeof(resp));
-
-  src.sin_addr = srcaddr;
-  src.sin_port = srcport;
-
-  dst.sin_addr = dstaddr;
-  dst.sin_port = dstport;
-
-  resp.sin_addr = respaddr;
-  resp.sin_port = respport;
-
-  ssize_t pos = rtable_find_resp(resp.sin_addr, resp.sin_port);
-  if ( pos < 0 ) {
-    CF_WARNING("rtable_find_resp() fails for %s:%u", inet_ntoa(resp.sin_addr), ntohs(resp.sin_port));
-    ccarray_push_back(&rtable, &(struct rtable_item ) {
-          .src = src,
-          .dst = dst,
-          .resp = resp,
-        });
-
-//    CF_WARNING("RTABLE Added src %s:%u", inet_ntoa(src.sin_addr), ntohs(src.sin_port));
-//    CF_WARNING("RTABLE Added dst %s:%u", inet_ntoa(dst.sin_addr), ntohs(dst.sin_port));
-//    CF_WARNING("RTABLE Added resp %s:%u", inet_ntoa(resp.sin_addr), ntohs(resp.sin_port));
+  pthread_t pid;
+  int status;
+  if ( (status = pthread_create(&pid, NULL, smaster_msgloop_thread, (void*) (ssize_t) (smaster_so))) ) {
+    CF_FATAL("pthread_create(smaster_msgloop_thread): %s", strerror(status));
   }
-  else {
-    struct rtable_item * item = ccarray_peek(&rtable, pos);
-//    CF_WARNING("rtable_find_resp() already exists for %s:%u", inet_ntoa(src.sin_addr), ntohs(src.sin_port));
-//    CF_WARNING("Update src to %s:%u", inet_ntoa(src.sin_addr), ntohs(src.sin_port));
-//    CF_WARNING("Update dst to %s:%u", inet_ntoa(dst.sin_addr), ntohs(dst.sin_port));
-    item->src = src;
-    item->dst = dst;
-  }
+  return status == 0;
 }
+
+
+
 
 ///////////////////
 
@@ -514,6 +706,7 @@ int main(int argc, char *argv[])
 
   char master_server_ip[256] = "";
   uint16_t master_server_port = 6010;
+  int smaster_so = -1;
 
 
   int i;
@@ -591,6 +784,12 @@ int main(int argc, char *argv[])
 
 
 
+  if ( !init_smaster_queue() ) {
+    CF_FATAL("init_smaster_requests_queue() fails: %s", strerror(errno));
+    return 1;
+  }
+
+
   CF_DEBUG("master_authenticate(master_server=%s:%u, client_id=%s)",
       master_server_ip, master_server_port, client_id);
 
@@ -643,6 +842,7 @@ int main(int argc, char *argv[])
   ccarray_init(&rtable, 1024, sizeof(struct rtable_item));
 
 
+  start_smaster_msgloop(smaster_so);
   start_mircosrv_thread(tunip);
   sleep(1);
 

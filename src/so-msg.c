@@ -12,7 +12,7 @@ int so_sprintf(int so, const char * format, ...)
 {
   va_list arglist;
   char * msg = NULL;
-  ssize_t cb;
+  ssize_t cb = 0;
   int n;
 
   /* sprintf() message into temporary memory buffer */
@@ -29,7 +29,7 @@ int so_sprintf(int so, const char * format, ...)
   /* Free malloc()-ed memory */
   free(msg);
 
-  return cb;
+  return (int)cb;
 }
 
 

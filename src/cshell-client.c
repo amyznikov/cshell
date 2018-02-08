@@ -50,14 +50,17 @@ static const char VERSION[] = CSHELL_VERSION;
 #define MAX_SMASTER_REQUESTS_QUEUE_SIZE 1000
 
 struct route_request {
+  uint64_t rid;
+  struct sockaddr_in resource_requested;
+  struct sockaddr_in resource_actual;
   int so;
-  struct sockaddr_in resource;
 };
 
+static int g_smaster_so = -1;
+static uint64_t g_smaster_rid = 1000;
 static ccarray_t smaster_queue; // <struct route_request>
-static int smaster_queue_eventfd = -1;
+//static int smaster_queue_eventfd = -1;
 static pthread_wait_t smaster_queue_lock = PTHREAD_WAIT_INITIALIZER;
-
 
 
 static bool init_smaster_queue(void)
@@ -67,18 +70,17 @@ static bool init_smaster_queue(void)
     return false;
   }
 
-  if ( (smaster_queue_eventfd = eventfd(0, 0)) == -1 ) {
-    CF_FATAL("ccarray_init(smaster_requests_queue) fails: %s ", strerror(errno));
-    return false;
-  }
-
-  CF_DEBUG("smaster_queue_eventfd=%d", smaster_queue_eventfd);
+//  if ( (smaster_queue_eventfd = eventfd(0, 0)) == -1 ) {
+//    CF_FATAL("ccarray_init(smaster_requests_queue) fails: %s ", strerror(errno));
+//    return false;
+//  }
+//
 
   return true;
 }
 
 
-static bool smaster_queue_push_request(int so, const struct sockaddr_in * resource)
+static bool smaster_queue_push(int so, const struct sockaddr_in * resource)
 {
   bool fOk = false;
 
@@ -89,15 +91,26 @@ static bool smaster_queue_push_request(int so, const struct sockaddr_in * resour
   }
   else {
 
+    uint64_t rid = g_smaster_rid++;
+    ssize_t cb;
+
     ccarray_push_back(&smaster_queue, &(struct route_request ) {
-          . so = so,
-          . resource = *resource
+          .rid = rid,
+          .resource_requested = *resource,
+          .so = so,
         });
 
-    eventfd_write(smaster_queue_eventfd, 1);
-    CF_DEBUG("eventfd_write() done");
+    cb = so_sprintf(g_smaster_so, "RR %"PRIu64" %s:%u\n", rid,
+        inet_ntoa(resource->sin_addr),
+        ntohs(resource->sin_port));
 
-    fOk = true;
+    if ( cb < 1 ) {
+      CF_FATAL("so_sprintf() fails: %s", strerror(errno));
+      ccarray_erase(&smaster_queue, ccarray_size(&smaster_queue) - 1);
+    }
+    else {
+      fOk = true;
+    }
   }
 
   pthread_wait_unlock(&smaster_queue_lock);
@@ -106,8 +119,28 @@ static bool smaster_queue_push_request(int so, const struct sockaddr_in * resour
 }
 
 
+static ssize_t smaster_queue_search(uint64_t rid)
+{
+  size_t i, n;
+  for ( i = 0, n = ccarray_size(&smaster_queue); i < n; ++i ) {
+    struct route_request * item = ccarray_peek(&smaster_queue, i);
+    if ( item->rid == rid ) {
+      return i;
+    }
+  }
+  return -1;
+}
 
-
+static bool smaster_queue_pop(uint64_t rid, struct route_request * item)
+{
+  ssize_t pos = smaster_queue_search(rid);
+  if ( pos >= 0 ) {
+    memcpy(item, ccarray_peek(&smaster_queue, pos), sizeof(*item));
+    ccarray_erase(&smaster_queue, pos);
+    return true;
+  }
+  return false;
+}
 
 
 
@@ -384,7 +417,7 @@ static void * mircosrv_thread(void * arg)
       const struct rtable_item * item = ccarray_peek(&rtable, pos);
       CF_DEBUG("REQUESTED ROUTE TO %s:%u", inet_ntoa(item->dst.sin_addr), ntohs(item->dst.sin_port));
 
-      if ( !smaster_queue_push_request(so2, &item->dst) ) {
+      if ( !smaster_queue_push(so2, &item->dst) ) {
         CF_FATAL("FATAL: smaster_queue_push_request() fails");
         so_close(so2, false);
       }
@@ -424,14 +457,15 @@ static bool start_mircosrv_thread(const char * bindaddrs)
 
 /////////////////////////////////////////////////////////////////////////////
 
-static void * smaster_msgloop_thread( void * arg)
+static void * smaster_msgloop_thread(void * arg)
 {
-  int smaster_so = (int)(ssize_t)(arg);
+  (void) (arg);
 
   static const int MAX_EPOLL_EVENTS = 100;
   struct epoll_event events[MAX_EPOLL_EVENTS];
   struct epoll_event * e;
   int epollfd = -1;
+
 
   int i, n;
   bool fail = false;
@@ -445,15 +479,9 @@ static void * smaster_msgloop_thread( void * arg)
     goto __end;
   }
 
-  /* manage tunfd to listen input packets */
-  if ( !epoll_add(epollfd, smaster_so, EPOLLIN) ) {
-    CF_FATAL("epoll_(epollfd=%d, smaster_so=%d) fails: %s", epollfd, smaster_so, strerror(errno));
-    goto __end;
-  }
-
-  /* manage smaster_queue_eventfd to listen input events */
-  if ( !epoll_add(epollfd, smaster_queue_eventfd, EPOLLIN) ) {
-    CF_FATAL("epoll_(epollfd=%d, smaster_queue_eventfd=%d) fails: %s", epollfd, smaster_queue_eventfd, strerror(errno));
+  /* manage g_smaster_so to listen */
+  if ( !epoll_add(epollfd, g_smaster_so, EPOLLIN) ) {
+    CF_FATAL("epoll_(epollfd=%d, smaster_so=%d) fails: %s", epollfd, g_smaster_so, strerror(errno));
     goto __end;
   }
 
@@ -464,35 +492,46 @@ static void * smaster_msgloop_thread( void * arg)
 
       e = &events[i];
 
-      if ( e->data.fd == smaster_so ) {
-        if ( e->events & EPOLLIN ) {
-          // fixme: data from master
-        }
-      }
-      else if ( e->data.fd == smaster_queue_eventfd ) {
-
+      if ( e->data.fd == g_smaster_so ) {
         if ( e->events & EPOLLIN ) {
 
-          struct route_request rr;
-          eventfd_t v = 0;
+          char line[1024] = "";
+          ssize_t cb;
 
-          pthread_wait_lock(&smaster_queue_lock);
-
-          eventfd_read(smaster_queue_eventfd, &v);
-          ccarray_pop_back(&smaster_queue, &rr);
-
-          pthread_wait_unlock(&smaster_queue_lock);
-
-          CF_NOTICE("QUEUE TRIGGERED: v=%llu rr.so=%d resource=%s:%u", (unsigned long long)v, rr.so, inet_ntoa(rr.resource.sin_addr), ntohs(rr.resource.sin_port) );
-
-          // make server transaction
-          {
-
-
+          if ( (cb = so_recv_line(g_smaster_so, line, sizeof(line))) < 1 ) {
+            CF_FATAL("so_recv_line(g_smaster_so=%d) fails: %s", g_smaster_so, strerror(errno));
+            fail = true;
+            break;
           }
 
-          ///////////////////////////////////
+          if ( strncmp(line, "RRR ", 4)  == 0 ) {
 
+            int64_t rid;
+            char ipaddrs[256] = "";
+            uint16_t port = 0;
+            struct route_request rr;
+
+            if ( sscanf(line + 4, "%"PRIu64" %255[^:]:%hu", &rid, ipaddrs, &port) != 3 ) {
+              CF_FATAL("APP BUG: Can not parse RRR responce '%s'", line);
+              fail = true;
+              break;
+            }
+
+            if ( !smaster_queue_pop(rid, &rr) ) {
+              CF_FATAL("APP BUG: RRR responce to not existent request '%s'", line);
+              fail = true;
+              break;
+            }
+
+            so_sockaddr_in(ipaddrs, port, &rr.resource_actual);
+
+            CF_DEBUG("Actual resource location is: %s:%u", inet_ntoa(rr.resource_actual.sin_addr),
+                ntohs(rr.resource_actual.sin_port));
+
+          }
+          else if ( strncmp(line, "NOTIFY ", 7)  == 0 ) {
+
+          }
         }
       }
 
@@ -505,8 +544,8 @@ __end:
     close(epollfd);
   }
 
-  if ( smaster_so != -1 ) {
-    close (smaster_so);
+  if ( g_smaster_so != -1 ) {
+    close (g_smaster_so);
   }
 
   return NULL;
@@ -514,11 +553,11 @@ __end:
 
 
 
-static bool start_smaster_msgloop(int smaster_so)
+static bool start_smaster_msgloop()
 {
   pthread_t pid;
   int status;
-  if ( (status = pthread_create(&pid, NULL, smaster_msgloop_thread, (void*) (ssize_t) (smaster_so))) ) {
+  if ( (status = pthread_create(&pid, NULL, smaster_msgloop_thread, NULL)) ) {
     CF_FATAL("pthread_create(smaster_msgloop_thread): %s", strerror(status));
   }
   return status == 0;
@@ -706,7 +745,7 @@ int main(int argc, char *argv[])
 
   char master_server_ip[256] = "";
   uint16_t master_server_port = 6010;
-  int smaster_so = -1;
+  //int smaster_so = -1;
 
 
   int i;
@@ -793,8 +832,8 @@ int main(int argc, char *argv[])
   CF_DEBUG("master_authenticate(master_server=%s:%u, client_id=%s)",
       master_server_ip, master_server_port, client_id);
 
-  smaster_so = master_authenticate(master_server_ip, master_server_port, client_id, tunip);
-  if ( smaster_so == -1 ) {
+  g_smaster_so = master_authenticate(master_server_ip, master_server_port, client_id, tunip);
+  if ( g_smaster_so == -1 ) {
     CF_FATAL("master_authenticate() fails: %s", strerror(errno));
     return 1;
   }
@@ -808,7 +847,7 @@ int main(int argc, char *argv[])
   if ( (tunfd = open_tunnel(node, tuniface, tunip, ifacemask, ifaceflags)) == -1 ) {
     CF_FATAL("open_tunnel(node=%s, tuniface=%s, tunip=%s, ifacemask=%s, ifaceflags=0x%0X) fails: %s",
         node, tuniface, tunip, ifacemask, ifaceflags, strerror(errno));
-    so_close(smaster_so, false);
+    so_close(g_smaster_so, false);
     return 1;
   }
 
@@ -842,7 +881,7 @@ int main(int argc, char *argv[])
   ccarray_init(&rtable, 1024, sizeof(struct rtable_item));
 
 
-  start_smaster_msgloop(smaster_so);
+  start_smaster_msgloop();
   start_mircosrv_thread(tunip);
   sleep(1);
 

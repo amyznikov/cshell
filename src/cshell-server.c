@@ -141,7 +141,7 @@ static struct client_account * get_client_account(const char * cid)
 }
 
 
-/* search client inventory by client id */
+/* search client connection by client id */
 static ssize_t find_client_connection(const char * cid)
 {
   size_t i, n;
@@ -163,6 +163,36 @@ static struct client_connection * get_client_connection(const char * cid)
   ssize_t pos = find_client_connection(cid);
   return pos < 0 ? NULL : ccarray_ppeek(&g_client_connections, pos);
 }
+
+
+/* search client connection by tunip */
+static ssize_t find_client_connection_tunip(const char * tunip)
+{
+  size_t i, n;
+  const struct client_connection * cc;
+
+  for ( i = 0, n = ccarray_size(&g_client_connections); i < n; ++i ) {
+    if ( strcmp((cc = ccarray_ppeek(&g_client_connections, i))->tunip, tunip) == 0 ) {
+      return (ssize_t) (i);
+    }
+  }
+
+  return (ssize_t) (-1);
+}
+
+
+/* get client inventory pointer by tunip */
+static struct client_connection * get_client_connection_tunip(const char * tunip)
+{
+  ssize_t pos = find_client_connection_tunip(tunip);
+  return pos < 0 ? NULL : ccarray_ppeek(&g_client_connections, pos);
+}
+
+
+
+
+
+
 
 static struct client_connection * authenticate_connection(int so )
 {
@@ -204,7 +234,7 @@ static struct client_connection * authenticate_connection(int so )
   else if ( ccarray_size(&g_client_connections) >= ccarray_capacity(&g_client_connections) ) {
     CF_FATAL("[so=%d][%s] BUG: NOT ENOUGH CONNECTION SLOTS. CONNECTION ABORTED.", so, cid);
   }
-  else if(!(cc = calloc(1, sizeof(struct client_connection)))) {
+  else if ( !(cc = calloc(1, sizeof(struct client_connection))) ) {
     CF_FATAL("[so=%d][%s] FATAL: calloc(%zu bytes) fails. CONNECTION ABORTED.", so, cid,
         sizeof(struct client_connection));
   }
@@ -224,7 +254,7 @@ static struct client_connection * authenticate_connection(int so )
     CF_FATAL("[so=%d][%s] FATAL: so_sprintf(tunip) fails. ABORTING CONNECTION.", so, cid);
 
     client_connections_lock();
-    ccarray_erase_item(&g_client_connections, cc);
+    ccarray_erase_item(&g_client_connections, &cc);
     client_connections_unlock();
 
     // cc memory will freed at __end
@@ -260,16 +290,63 @@ static void * cshell_server_client_thread(void * arg)
     goto __end;
   }
 
-  while ( (cb = so_recv_line(so, msg, sizeof(msg))) ) {
+
+
+  while ( (cb = so_recv_line(so, msg, sizeof(msg))) > 0 ) {
+
     CF_DEBUG("[%d][%s] msg='%s'", so, cc->id, msg);
+
+    if ( strncmp(msg, "RR ", 3 )  == 0 ) {
+
+      int64_t rid = 0;
+      char ipaddrs[256] = "";
+      uint16_t port = 0;
+
+      char responce[256] = "";
+
+      struct client_connection * cc = NULL;
+
+
+      CF_DEBUG("RESOURCE ACCESS REQUESTED");
+
+      if ( sscanf(msg + 3, "%"PRIu64" %255[^:]:%hu", &rid, ipaddrs, &port) != 3 ) {
+        CF_FATAL("APP BUG: Can not parse RR request '%s'", msg);
+        so_sprintf(so, "RRR %"PRIu64" 0.0.0.0:0\n", rid);
+        continue;
+      }
+
+      client_connections_lock();
+
+      if ( !(cc = get_client_connection_tunip(ipaddrs)) ) {
+        CF_FATAL("REQUESTED RESOURCE NOT AVAILABLE: %s", ipaddrs);
+        sprintf(responce, "RRR %"PRIu64" 0.0.0.0:0", rid);
+      }
+      else {
+
+        struct sockaddr_in sin;
+        socklen_t sinlen = sizeof(sin);
+
+        getpeername(cc->so, (struct sockaddr*)&sin, &sinlen);
+
+        sprintf(responce, "RRR %"PRIu64" %s:%u", rid, inet_ntoa(sin.sin_addr), port);
+      }
+
+      client_connections_unlock();
+
+      so_sprintf(so, "%s\n", responce);
+    }
+
   }
+
+  CF_NOTICE("Connection lost");
+
 
 __end:
 
   if ( cc ) {
 
     client_connections_lock();
-    ccarray_erase_item(&g_client_connections, cc);
+    ccarray_erase_item(&g_client_connections, &cc);
     client_connections_unlock();
 
     so_close(cc->so, false);

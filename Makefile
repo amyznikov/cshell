@@ -42,9 +42,9 @@ LDFLAGS = $(CFLAGS)
 
 
 
-COMMON_SOURCES = src/debug.c  src/sockopt.c src/checksum.c
+COMMON_SOURCES = src/debug.c  src/sockopt.c 
 
-CLIENT_SOURCES = $(COMMON_SOURCES) src/cshell-client.c
+CLIENT_SOURCES = $(COMMON_SOURCES) src/cshell-client.c src/tunnel.c src/checksum.c src/ip-pkt.c
 SERVER_SOURCES = $(COMMON_SOURCES) src/cshell-server.c
 ROUTER_SOURCES = $(COMMON_SOURCES) src/cshell-router.c
 TCPTST_SOURCES = $(COMMON_SOURCES) src/raw-tcp-tester.c

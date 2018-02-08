@@ -13,28 +13,22 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <string.h>
-#include <fcntl.h>
-#include <sys/ioctl.h>
+//#include <fcntl.h>
+//#include <sys/ioctl.h>
 #include <sys/socket.h>
-#include <sys/epoll.h>
 #include <arpa/inet.h>
-#include <linux/if.h>
-#include <linux/if_tun.h>
-#include <netinet/in.h>
+//#include <linux/if.h>
+//#include <linux/if_tun.h>
+//#include <netinet/in.h>
 
-#include <netinet/ip.h>
-#include <netinet/ip6.h>
-
-#include <netinet/ip_icmp.h>
-#include <netinet/icmp6.h>
-
-#include <netinet/tcp.h>
-#include <netinet/udp.h>
 
 #include <pthread.h>
 
 #include "sockopt.h"
+#include "tunnel.h"
 #include "checksum.h"
+#include "ip-pkt.h"
+#include "epoll-ctl.h"
 #include "ccarray.h"
 #include "debug.h"
 
@@ -45,163 +39,12 @@
 
 static const char VERSION[] = CSHELL_VERSION;
 
-
-
-
-/**************************************************************************
- * create_tunnel()
- * allocates or reconnects to a tun device.
- *
- *  node : "/dev/net/tun"
- **************************************************************************/
-static int open_tunnel_device(const char * node, char iface[IFNAMSIZ], int flags)
-{
-  struct ifreq ifr;
-  int fd;
-
-  if ( (fd = open(node, O_RDWR)) < 0 ) {
-    CF_FATAL("open(%s) fauls: %s", node, strerror(errno));
-    return -1;
-  }
-
-
-  memset(&ifr, 0, sizeof(ifr));
-  ifr.ifr_flags = flags;
-  if ( iface && *iface ) {
-    strncpy(ifr.ifr_name, iface, sizeof(ifr.ifr_name));
-  }
-
-
-  if ( ioctl(fd, TUNSETIFF, &ifr) == -1 ) {
-    CF_FATAL("ioctl(fd=%d, TUNSETIFF) fails: %s", fd, strerror(errno));
-    close(fd), fd = -1;
-  }
-  else if ( iface ) {
-    strncpy(iface, ifr.ifr_name, IFNAMSIZ);
-  }
-
-  return fd;
-}
-
-// mask: "255.255.255.0"
-static bool set_tunnel_ip(const char * iface, const char * addrs, const char * mask)
-{
-  struct ifreq ifr;
-  int so = -1;
-  bool fOk = false;
-
-  memset(&ifr, 0, sizeof(ifr));
-  strncpy(ifr.ifr_name, iface, sizeof(ifr.ifr_name));
-
-  if ( (so = socket(AF_INET, SOCK_DGRAM, 0)) == -1 ) {
-    CF_FATAL("socket(AF_INET, SOCK_DGRAM, 0) fails: %s", strerror(errno));
-    goto __end;
-  }
-
-
-
-  if ( addrs ) {
-
-    struct sockaddr_in * sin = (struct sockaddr_in *)&ifr.ifr_addr;
-    memset(sin, 0, sizeof(*sin));
-    sin->sin_family = AF_INET;
-    inet_pton(AF_INET, addrs, &sin->sin_addr);
-
-
-    if ( ioctl(so, SIOCSIFADDR, &ifr) == -1 ) {
-      CF_FATAL("ioctl(so=%d, SIOCSIFADDR, '%s') fails: %s", so, addrs, strerror(errno));
-      goto __end;
-    }
-  }
-
-
-
-
-  if ( mask ) {
-
-    struct sockaddr_in * sin = (struct sockaddr_in *)&ifr.ifr_netmask;
-    memset(sin, 0, sizeof(*sin));
-    sin->sin_family = AF_INET;
-    inet_pton(AF_INET, mask, &sin->sin_addr);
-
-    if ( ioctl(so, SIOCSIFNETMASK, &ifr) == -1 ) {
-      CF_FATAL("ioctl(so=%d, SIOCSIFNETMASK, '%s') fails: %s", so, mask, strerror(errno));
-      goto __end;
-    }
-  }
-
-
-
-  fOk = true;
-
-__end:
-
-  if ( so != -1 ) {
-    close(so);
-  }
-
-  return fOk;
-}
-
-
-// IFF_UP | IFF_RUNNING | IFF_MULTICAST | IFF_NOARP
-static bool set_tunnel_flags(const char * iface, int flags)
-{
-  struct ifreq ifr;
-  int so = -1;
-  bool fOk = false;
-
-  memset(&ifr, 0, sizeof(ifr));
-  strncpy(ifr.ifr_name, iface, sizeof(ifr.ifr_name));
-
-  if ( (so = socket(AF_INET, SOCK_DGRAM, 0)) == -1 ) {
-    CF_FATAL("socket(AF_INET, SOCK_DGRAM, 0) fails: %s", strerror(errno));
-    goto __end;
-  }
-
-  ifr.ifr_flags = flags;
-  if ( ioctl(so, SIOCSIFFLAGS, &ifr) == -1 ) {
-    CF_FATAL("ioctl(so=%d, SIOCSIFFLAGS) fails: %s", so, strerror(errno));
-    goto __end;
-  }
-
-  fOk = true;
-
-  __end :
-  if ( so != -1 ) {
-    close(so);
-  }
-
-  return fOk;
-}
-
-
 ///////////////////////////////////////////////////////////////////////////////////
-
-static inline bool epoll_add(int epollfd, int so, uint32_t events)
-{
-  int status = epoll_ctl(epollfd, EPOLL_CTL_ADD, so,
-      &(struct epoll_event ) {
-            .data.fd = so,
-            .events = events // (events | ((events & EPOLLONESHOT) ? 0 : EPOLLET))
-          });
-
-  return status == 0;
-}
-
-
-static inline bool epoll_remove(int epollfd, int so)
-{
-  return epoll_ctl(epollfd, EPOLL_CTL_DEL, so, NULL) == 0;
-}
-
-/////////////////////////////////////////////////////////////////////////////
 
 static char g_bindaddrs[256];
 struct sockaddr_in g_tcpserver_address;
 
 struct sockaddr_in g_master_server_address;
-
 
 
 static void * microsrv_client_thread(void * arg)
@@ -328,7 +171,7 @@ static void * mircosrv_thread(void * arg)
     return NULL;
   }
 
-  while ( (so2 = accept(so1, &addrsfrom, &addrslen)) != -1 ) {
+  while ( (so2 = accept(so1, (struct sockaddr*) &addrsfrom, &addrslen)) != -1 ) {
 
     CF_CRITICAL("ACCEPTED FROM %s:%u", inet_ntoa(addrsfrom.sin_addr), ntohs(addrsfrom.sin_port));
 
@@ -365,22 +208,6 @@ static bool start_mircosrv_thread(const char * bindaddrs)
 
 /////////////////////////////////////////////////////////////////////////////
 
-static const char * protoname(int protocol_id)
-{
-  switch ( protocol_id ) {
-  case IPPROTO_ICMP :
-    return "ICMP";
-  case IPPROTO_TCP :
-    return "TCP";
-  case IPPROTO_UDP :
-    return "UDP";
-  default :
-    return "OTHER";
-  }
-}
-
-
-///////////////////
 
 struct rtable_item {
   struct sockaddr_in src, dst, resp;
@@ -443,107 +270,6 @@ static void rtable_add_route(struct in_addr srcaddr, in_port_t srcport,
 ///////////////////
 
 
-static bool parsepkt(void * buf, size_t size, struct ip ** _ip, size_t * _iphsize,
-    struct tcphdr ** _tcp, size_t * _tcphsize, void ** _tcppld, size_t * _pldsize)
-{
-  struct ip * pkt = NULL;
-  struct tcphdr * tcp = NULL;
-  ssize_t pktsize, iphsize, tcphsize;
-
-  if ( _ip ) {
-    *_ip = NULL;
-  }
-  if ( _iphsize ) {
-    *_iphsize = 0;
-  }
-  if ( _tcp ) {
-    *_tcp = NULL;
-  }
-  if ( _tcphsize ) {
-    *_tcphsize = 0;
-  }
-  if ( _tcppld ) {
-    *_tcppld = NULL;
-  }
-  if ( _pldsize ) {
-    *_pldsize = 0;
-  }
-
-  if ( (pkt = buf)->ip_v != 4  ) {
-    CF_DEBUG("NOT IPv4");
-    return false;
-  }
-
-  if ( size != (pktsize = ntohs(pkt->ip_len)) ) {
-    CF_DEBUG("Invalid pkt size");
-    return false;
-  }
-
-
-  if ( _ip ) { // ip header pointer
-    *_ip = pkt;
-  }
-
-  iphsize = pkt->ip_hl * 4; // ip header size in bytes
-  if ( _iphsize ) {
-    * _iphsize = iphsize;
-  }
-
-  if ( pkt->ip_p != IPPROTO_TCP ) {
-    CF_DEBUG(" Not a TCP: pkt->ip_p=%u", pkt->ip_p);
-  }
-  else{
-
-    tcp = (struct tcphdr *) (((uint8_t*) pkt) + iphsize);
-    if ( _tcp ) {
-      *_tcp = tcp;
-    }
-
-    tcphsize = tcp->doff * 4;
-    if ( _tcphsize ) {
-      *_tcphsize = tcphsize;
-    }
-
-    if ( _tcppld ) {
-      *_tcppld = ((uint8_t*) tcp) + tcphsize;
-    }
-
-    if ( _pldsize ) {
-      ssize_t hdrsize = pkt->ip_hl * 4 + tcp->doff * 4;
-      *_pldsize = pktsize > hdrsize ? pktsize - hdrsize : 0;
-    }
-  }
-
-  return true;
-}
-
-static void dumppkt2(const char * prefix,
-    const struct ip * ip,
-    size_t iphsize,
-    const struct tcphdr * tcp,
-    size_t tcphsize,
-    void * tcppld,
-    size_t pldsize)
-{
-  char srcaddrs[256], dstaddrs[256];
-
-  sprintf(srcaddrs, "%s:%u", inet_ntoa(ip->ip_src), ntohs(tcp->source));
-  sprintf(dstaddrs, "%s:%u", inet_ntoa(ip->ip_dst), ntohs(tcp->dest));
-
-  CF_NOTICE("%s %s --> %s  ip_len=%u IP-CHK=%u TCP-CHK=%u SYN=%u FIN=%u RST=%u ACK=%u SEQ=%u DOFF=%u",
-      prefix,
-      srcaddrs, dstaddrs,
-      ntohs(ip->ip_len),
-      ntohs(ip->ip_sum),
-      ntohs(tcp->check),
-      tcp->syn, tcp->fin, tcp->rst, tcp->ack,
-      tcp->seq,
-      tcp->doff);
-  if ( pldsize > 0 ) {
-    // *((char*)tcppld + pldsize) = 0;
-    CF_DEBUG("%s PLD='%s'", prefix, (char*)tcppld);
-  }
-}
 
 /* read from tunnel, update destination and send to raw socket */
 static ssize_t rdtun(int tunfd)
@@ -579,7 +305,7 @@ static ssize_t rdtun(int tunfd)
     return 0;
   }
 
-  //dumppkt2("R", ip, iphsize, tcp, tcphsize, tcppld, pldsize);
+  //dumppkt("R", ip, iphsize, tcp, tcphsize, tcppld, pldsize);
 
   if ( ip->ip_src.s_addr == g_tcpserver_address.sin_addr.s_addr && tcp->source == g_tcpserver_address.sin_port ) {
 
@@ -619,7 +345,7 @@ static ssize_t rdtun(int tunfd)
   update_ip_checksum(ip);
   update_tcp_checksum(ip);
 
-  // dumppkt2("W", ip, iphsize, tcp, tcphsize, tcppld, pldsize);
+  // dumppkt("W", ip, iphsize, tcp, tcphsize, tcppld, pldsize);
 
   cb = write(tunfd, ip, ntohs(ip->ip_len));
   if ( cb <= 0 ) {
@@ -879,198 +605,5 @@ int main(int argc, char *argv[])
 
 
 #if 0
-//
-//  {
-//    int listen_so = tcp_listen(ifaceip, 6444);
-//    if ( listen_so == -1 ) {
-//      CF_FATAL("tcp_listen() fails");
-//      return 1;
-//    }
-//
-//    CF_DEBUG("Listen started!!!!");
-//
-//    struct sockaddr_in address_from;
-//    socklen_t address_from_len = sizeof(address_from);
-//    int so;
-//
-//
-//    while ( (so = accept(listen_so, &address_from, &address_from_len) ) != -1 ) {
-//      CF_DEBUG("Accepted NEW TCP connection from: %s:%u", inet_ntoa(address_from.sin_addr), ntohs(address_from.sin_port));
-//
-//      char buf[4*1024] = "";
-//
-//      ssize_t cb = recv(so, buf, sizeof(buf)-1, 0);
-//
-//      printf("%s\n", buf);
-//      // close(so);
-//    }
-//
-//  }
-
-static int tunnel(int srcfd, int dstfd, const struct sockaddr_in * tcpdst, int rawfd)
-{
-  const size_t MAX_PKT_SIZE = 4 * 1024;    // MUST BE >= MAX POSSIBLE MTU
-  uint32_t pktbuf[MAX_PKT_SIZE / sizeof(uint32_t)];
-  struct ip * pkt;
-  struct tcphdr * tcp;
-  char * tcppld;
-  size_t doff;
-  ssize_t cb;
-  ssize_t pos;
-  size_t pktsize;
-
-  if ( (cb = read(srcfd, pktbuf, sizeof(pktbuf))) < 0 ) {
-    CF_FATAL("read(srcfd=%d) fails: %s", srcfd, strerror(errno));
-    return -1;
-  }
-
-
-  pkt = (struct ip *) pktbuf;
-  if ( pkt->ip_v != 4 ) {
-    //CF_DEBUG("IPv6 pkt, ignored");
-    return 0;
-  }
-
-  if ( pkt->ip_p != IPPROTO_TCP ) {
-    CF_DEBUG("Not a TCP, ignored");
-    return 0;
-  }
-
-  pktsize = ntohs(pkt->ip_len);
-  tcp = (struct tcphdr *) (((uint8_t*) pkt) + pkt->ip_hl * 4);
-  doff = tcp->doff * 4;
-  tcppld = ((uint8_t*) tcp) + doff;
-
-//  if ( (pos = rtable_find_addrs(pkt->ip_src, tcp->source, pkt->ip_dst, tcp->dest)) < 0 ) {
-//    rtable_add_route(pkt->ip_src, tcp->source, pkt->ip_dst, tcp->dest);
-//    pos = ccarray_size(&rtable) - 1;
-//  }
-
-  CF_DEBUG("\n\nTCPDST= %s:%u", inet_ntoa(tcpdst->sin_addr), ntohs(tcpdst->sin_port));
-  CF_DEBUG("srcfd=%d dstfd=%d pktsize=%zu", srcfd, dstfd, pktsize);
-  CF_DEBUG("B SRC=%s:%u", inet_ntoa(pkt->ip_src), ntohs(tcp->source));
-  CF_DEBUG("B DST=%s:%u", inet_ntoa(pkt->ip_dst), ntohs(tcp->dest));
-  CF_DEBUG("B CHK=%u", ntohs(pkt->ip_sum));
-  CF_DEBUG("B SYN=%u\n", tcp->syn);
-
-  pkt->ip_dst = tcpdst->sin_addr;
-  //tcp->dest = tcpdst->sin_port;
-  update_ip_checksum(pkt);
-
-  CF_DEBUG("A SRC=%s:%u", inet_ntoa(pkt->ip_src), ntohs(tcp->source));
-  CF_DEBUG("A DST=%s:%u", inet_ntoa(pkt->ip_dst), ntohs(tcp->dest));
-  CF_DEBUG("A CHK=%u", ntohs(pkt->ip_sum));
-  CF_DEBUG("A SYN=%u", tcp->syn);
-
-  //cb = write(srcfd, pkt, pktsize);
-  cb = sendto(rawfd, tcp/*pkt*/, pktsize-pkt->ip_hl * 4, 0, tcpdst, sizeof(*tcpdst));
-  if ( cb <= 0 ) {
-    CF_FATAL("write(tunfd) fails: %s", strerror(errno));
-  }
-
-  //handle_packet_from_tunnel(pkt, cb, tunfd1, tcpdst);
-
-  return cb;
-}
-
-
-//Datagram to represent the packet
-static void gendgram(char datagram[4096], const char * source_ip, uint16_t source_port, const char * dest_ip, uint16_t dest_port,
-    void * tcpopts, size_t tcpoptssize )
-{
-  char *data, *pseudogram;
-  void * optsptr;
-
-  struct sockaddr_in src_sin;
-  struct sockaddr_in dst_sin;
-
-  CF_DEBUG("tcpoptssize=%zu", tcpoptssize);
-  /*
-   96 bit (12 bytes) pseudo header needed for tcp header checksum calculation
-   */
-  struct pseudo_header
-  {
-    u_int32_t source_address;
-    u_int32_t dest_address;
-    u_int8_t placeholder;
-    u_int8_t protocol;
-    u_int16_t tcp_length;
-  };
-
-  //zero out the packet buffer
-  memset(datagram, 0, 4096);
-  so_sockaddr_in(source_ip, source_port, &src_sin);
-  so_sockaddr_in(dest_ip, dest_port, &dst_sin );
-
-  //IP header
-  struct iphdr *iph = (struct iphdr *) datagram;
-
-  //TCP header
-  struct tcphdr *tcph = (struct tcphdr *) (datagram + sizeof(struct ip));
-
-  //Data part
-  optsptr = datagram + sizeof(struct iphdr) + sizeof(struct tcphdr);
-  data = datagram + sizeof(struct iphdr) + sizeof(struct tcphdr) + tcpoptssize;
-  strcpy(data, "");
-
-  //Fill in the IP Header
-  iph->ihl = 5;
-  iph->version = 4;
-  iph->tos = 0;
-  iph->tot_len = htons(sizeof(struct iphdr) + sizeof(struct tcphdr) + tcpoptssize +  strlen(data));
-  iph->id = htonl(54321);    //Id of this packet
-  iph->frag_off = 0;
-  iph->ttl = 255;
-  iph->protocol = IPPROTO_TCP;
-  iph->check = 0;      //Set to 0 before calculating checksum
-  iph->saddr = src_sin.sin_addr.s_addr; // Spoof the source ip address
-  iph->daddr = dst_sin.sin_addr.s_addr;
-
-  //Ip checksum
-  iph->check = 0;// csum((unsigned short *) datagram, ntohs(iph->tot_len));
-
-  //TCP Header
-  tcph->source = src_sin.sin_port;// htons(1234);
-  tcph->dest = dst_sin.sin_port;// htons(80);
-  tcph->seq = 0;
-  tcph->ack_seq = 0;
-  tcph->doff = 5 + tcpoptssize / 4;    //tcp header size
-  tcph->fin = 0;
-  tcph->syn = 1;
-  tcph->rst = 0;
-  tcph->psh = 0;
-  tcph->ack = 0;
-  tcph->urg = 0;
-  tcph->window = htons(5840); /* maximum allowed window size */
-  tcph->check = 0;    //leave checksum 0 now, filled later by pseudo header
-  tcph->urg_ptr = 0;
-
-  if ( tcpopts ) {
-    memcpy(optsptr, tcpopts, tcpoptssize);
-  }
-
-  //Now the TCP checksum
-  update_tcp_checksum((struct ip *) datagram);
-
-//  struct pseudo_header psh;
-//  psh.source_address = src_sin.sin_addr.s_addr;// inet_addr(source_ip);
-//  psh.dest_address = dst_sin.sin_addr.s_addr;
-//  psh.placeholder = 0;
-//  psh.protocol = IPPROTO_TCP;
-//  psh.tcp_length = htons(sizeof(struct tcphdr) + tcpoptssize + strlen(data));
-//  CF_DEBUG("psh.tcp_length=%u", ntohs(psh.tcp_length));
-//
-//  int psize = sizeof(struct pseudo_header) + sizeof(struct tcphdr) + tcpoptssize + strlen(data);
-//  pseudogram = malloc(psize);
-//  CF_DEBUG("psize=%d", psize);
-//
-//  memcpy(pseudogram, (char*) &psh, sizeof(struct pseudo_header));
-//  memcpy(pseudogram + sizeof(struct pseudo_header), tcph, sizeof(struct tcphdr) + tcpoptssize + strlen(data));
-//  tcph->check = tcp_checksum(pseudogram, psize);
-
-  CF_DEBUG("tcph->check=%u", tcph->check);
-}
-
-
 
 #endif

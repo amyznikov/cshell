@@ -46,7 +46,7 @@ LDLIBS = -L/usr/local/lib -lcuttle -lssl -lcrypto -pthread
 
 COMMON_SOURCES = src/so-msg.c src/corpc-msg.c
 
-CLIENT_SOURCES = $(COMMON_SOURCES) src/cshell-client.c src/tunnel.c src/checksum.c src/ip-pkt.c
+CLIENT_SOURCES = $(COMMON_SOURCES) src/cshell-client.c src/tunnel.c  src/rdtun.c src/checksum.c src/ip-pkt.c
 SERVER_SOURCES = $(COMMON_SOURCES) src/cshell-server.c
 ROUTER_SOURCES = $(COMMON_SOURCES) src/cshell-router.c
 TCPTST_SOURCES = $(COMMON_SOURCES) src/raw-tcp-tester.c

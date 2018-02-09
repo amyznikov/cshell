@@ -312,6 +312,8 @@ static void on_smaster_get_resource(corpc_stream * st)
 
   /* search online client with given resource id (actualy tunip) */
 
+  CF_DEBUG("REQUEST.RESOURCE_ID='%s'", request.resource_id);
+
   if ( sscanf(request.resource_id, "%15[^:]:%hu", tunip, &port) < 1 ) {
     CF_FATAL("invalid resource id requested: '%s'", request.resource_id);
     goto end;

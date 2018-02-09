@@ -8,7 +8,7 @@
 #include <stdio.h>
 #include <arpa/inet.h>
 #include "ip-pkt.h"
-#include "debug.h"
+#include <cuttle/debug.h>
 
 bool parsepkt(void * buf, size_t size, struct ip ** _ip, size_t * _iphsize,
     struct tcphdr ** _tcp, size_t * _tcphsize, void ** _tcppld, size_t * _pldsize)

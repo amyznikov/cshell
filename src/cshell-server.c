@@ -12,11 +12,13 @@
 #include <limits.h>
 #include <arpa/inet.h>
 
-#include "pthread_wait.h"
-#include "sockopt.h"
-#include "so-msg.h"
-#include "ccarray.h"
-#include "debug.h"
+#include <cuttle/corpc/server.h>
+#include <cuttle/ssl/init-ssl.h>
+#include <cuttle/sockopt.h>
+#include <cuttle/ccarray.h>
+#include <cuttle/debug.h>
+
+#include "smaster.h"
 
 
 #ifndef CSHELL_VERSION
@@ -32,10 +34,11 @@ static const char VERSION[] = CSHELL_VERSION;
 
 
 // Personal client inventory
+typedef
 struct client_account {
   char  id[MAX_CLIENT_ID];
   char  tunip[MAX_TUN_IP];
-};
+} client_account;
 
 // Global list (aka database) of registerd client accounts
 static ccarray_t g_client_accounts; // <struct client_account>
@@ -45,45 +48,19 @@ static ccarray_t g_client_accounts; // <struct client_account>
 
 
 // Actual connections from clients
-struct client_connection {
+typedef
+struct client_context {
+  corpc_channel * channel;
   char  id[MAX_CLIENT_ID];
   char  tunip[MAX_TUN_IP];
-  int   so;
-};
+  char  realip[16];
+  uint16_t realp;
+} client_context;
 
 #define MAX_CLIENT_CONNECTIONS \
     (ccarray_size(&g_client_accounts))
 
-static ccarray_t g_client_connections;
-static pthread_wait_t g_client_connections_lock;
-
-
-
-
-
-/*
- * Interthread locks management for g_client_connections array
- * */
-
-static void client_connections_lock(void)
-{
-  pthread_wait_lock(&g_client_connections_lock);
-}
-
-static void client_connections_unlock(void)
-{
-  pthread_wait_unlock(&g_client_connections_lock);
-}
-
-static int client_connections_wait(int tmo)
-{
-  return pthread_wait(&g_client_connections_lock, tmo);
-}
-
-static void client_connections_signal(void)
-{
-  pthread_wait_signal(&g_client_connections_lock);
-}
+static ccarray_t g_client_connections; // <struct client_context *>
 
 
 
@@ -116,7 +93,6 @@ static bool load_client_accounts(const char * filename)
   return ccarray_size(&g_client_accounts) > 0;
 }
 
-
 /* search client inventory by client id */
 static ssize_t find_client_account(const char * cid)
 {
@@ -141,11 +117,32 @@ static struct client_account * get_client_account(const char * cid)
 }
 
 
+
+
+static client_context * client_context_new(corpc_channel * channel)
+{
+  struct sockaddr_in addrs;
+  socklen_t addrslen = sizeof(addrs);
+  client_context * cc;
+
+  if ( (cc = calloc(1, sizeof(struct client_context))) ) {
+    cc->channel = channel;
+    if ( corpc_channel_get_peername(channel, (struct sockaddr*)&addrs, &addrslen) ) {
+      strcpy(cc->realip, inet_ntoa(addrs.sin_addr));
+      cc->realp = ntohs(addrs.sin_port);
+    }
+  }
+
+  return cc;
+}
+
+
+
 /* search client connection by client id */
 static ssize_t find_client_connection(const char * cid)
 {
   size_t i, n;
-  const struct client_connection * cc;
+  const struct client_context * cc;
 
   for ( i = 0, n = ccarray_size(&g_client_connections); i < n; ++i ) {
     if ( strcmp((cc = ccarray_ppeek(&g_client_connections, i))->id, cid) == 0 ) {
@@ -158,7 +155,7 @@ static ssize_t find_client_connection(const char * cid)
 
 
 /* get client inventory pointer by client id */
-static struct client_connection * get_client_connection(const char * cid)
+static struct client_context * get_client_connection(const char * cid)
 {
   ssize_t pos = find_client_connection(cid);
   return pos < 0 ? NULL : ccarray_ppeek(&g_client_connections, pos);
@@ -169,7 +166,7 @@ static struct client_connection * get_client_connection(const char * cid)
 static ssize_t find_client_connection_tunip(const char * tunip)
 {
   size_t i, n;
-  const struct client_connection * cc;
+  const struct client_context * cc;
 
   for ( i = 0, n = ccarray_size(&g_client_connections); i < n; ++i ) {
     if ( strcmp((cc = ccarray_ppeek(&g_client_connections, i))->tunip, tunip) == 0 ) {
@@ -182,7 +179,7 @@ static ssize_t find_client_connection_tunip(const char * tunip)
 
 
 /* get client inventory pointer by tunip */
-static struct client_connection * get_client_connection_tunip(const char * tunip)
+static struct client_context * get_client_connection_tunip(const char * tunip)
 {
   ssize_t pos = find_client_connection_tunip(tunip);
   return pos < 0 ? NULL : ccarray_ppeek(&g_client_connections, pos);
@@ -192,193 +189,208 @@ static struct client_connection * get_client_connection_tunip(const char * tunip
 
 
 
-
-
-static struct client_connection * authenticate_connection(int so )
+/* called by corpc when new client connection is accepted */
+static void on_client_accepted(corpc_channel * channel)
 {
-  // client id
-  char cid[MAX_CLIENT_ID] = "";
+  corpc_channel_set_client_context(channel, client_context_new(channel));
+}
 
+/* called by corpc when client is diconnected */
+static void on_client_disconnected(corpc_channel * channel)
+{
+  client_context * cc = corpc_channel_get_client_context(channel);
+  if ( cc ) {
+    ccarray_erase_item(&g_client_connections, &cc);
+    corpc_channel_set_client_context(channel, NULL);
+    free(cc);
+  }
+}
+
+/* called by corpc when client sends auth request */
+static void on_smaster_authenticate(corpc_stream * st)
+{
+  struct client_context * cc = NULL;
   struct client_account * acc = NULL;
-  struct client_connection * cc = NULL;
-  struct client_connection * existing_cc = NULL;
 
-  ssize_t cb;
+  struct auth_request request = {
+    .cid = "",
+  };
 
-  bool fOk = false;
+  struct auth_responce responce = {
+    .tunip = "",
+  };
+
+
+  CF_DEBUG("ENTER");
 
   /* proto: client must send his ID in first message line */
-  if ( (cb = so_recv_line(so, cid, sizeof(cid))) < 1 ) {
-    CF_FATAL("so=%d] so_recv_line() fails", so);
-    goto __end;
+  if ( !corpc_stream_recv_auth_request(st, &request) ) {
+    CF_CRITICAL("corpc_stream_read_auth_request() fails");
+    goto end;
   }
-
-  CF_DEBUG("[so=%d] client id = '%s'", so, cid);
 
 
   /* proto: client id must be registered in inventory database */
-  if ( !(acc = get_client_account(cid)) ) {
-    CF_FATAL("[so=%d] client id = '%s' is NOT REGISTERED", so, cid);
-    goto __end;
+  CF_DEBUG("ClientID='%s'", request.cid);
+  if ( !(acc = get_client_account(request.cid)) ) {
+    CF_FATAL("ClientId = '%s' is NOT REGISTERED", request.cid);
+    goto end;
   }
-
 
   /* proto: client id must NOT be already connected */
-
-  client_connections_lock();
-
-  if ( (existing_cc = get_client_connection(cid)) ) {
-    CF_FATAL("[so=%d][%s] ALREADY CONNECTED VIA so=%d with tunip=%s", so, cid,
-        existing_cc->so, existing_cc->tunip);
-  }
-  else if ( ccarray_size(&g_client_connections) >= ccarray_capacity(&g_client_connections) ) {
-    CF_FATAL("[so=%d][%s] BUG: NOT ENOUGH CONNECTION SLOTS. CONNECTION ABORTED.", so, cid);
-  }
-  else if ( !(cc = calloc(1, sizeof(struct client_connection))) ) {
-    CF_FATAL("[so=%d][%s] FATAL: calloc(%zu bytes) fails. CONNECTION ABORTED.", so, cid,
-        sizeof(struct client_connection));
-  }
-  else {
-    cc->so = so;
-    strncpy(cc->id, acc->id, sizeof(cc->id) - 1);
-    strncpy(cc->tunip, acc->tunip, sizeof(cc->tunip) - 1);
-    ccarray_push_back(&g_client_connections, &cc);
-    fOk = true;
+  if ( (cc = get_client_connection(request.cid)) ) {
+    CF_FATAL("[%s] ALREADY CONNECTED WITH tunip=%s", request.cid, cc->tunip);
+    cc = NULL;
+    goto end;
   }
 
-  client_connections_unlock();
+  /* mark client online (add to g_client_connections ) */
+  if ( ccarray_size(&g_client_connections) >= ccarray_capacity(&g_client_connections) ) {
+    CF_FATAL("[%s] BUG: NOT ENOUGH CONNECTION SLOTS. CONNECTION ABORTED.", request.cid);
+    goto end;
+  }
+
+  /* The actual client context struct is already calloc-ed in on_client_accepted(),
+   * but was not initialized */
+  if ( !(cc = corpc_stream_get_channel_client_context(st)) ) {
+    CF_FATAL("[%s] APP BUG: corpc_stream_get_channel_client_context() return NULL.\n"
+        "CONNECTION ABORTED.", request.cid);
+    goto end;
+  }
+
+  strncpy(cc->id, acc->id, sizeof(cc->id) - 1);
+  strncpy(cc->tunip, acc->tunip, sizeof(cc->tunip) - 1);
+  ccarray_push_back(&g_client_connections, &cc);
 
   /* proto: client expect tunip in auth server responce */
-  if ( (cb = so_sprintf(so, "%s\n", cc->tunip)) <= 0 ) {
-
-    CF_FATAL("[so=%d][%s] FATAL: so_sprintf(tunip) fails. ABORTING CONNECTION.", so, cid);
-
-    client_connections_lock();
-    ccarray_erase_item(&g_client_connections, &cc);
-    client_connections_unlock();
-
-    // cc memory will freed at __end
-    fOk = false;
+  strncpy(responce.tunip, acc->tunip, sizeof(responce.tunip) - 1);
+  if ( !corpc_stream_send_auth_responce(st, &responce) ) {
+    CF_CRITICAL("[%s] corpc_stream_send_auth_responce() fails", cc->id);
+    goto end;
   }
 
-__end:
+  CF_DEBUG("[%s] AUTHENTICATED. TUNIP=%s", cc->id, cc->tunip);
 
-  if ( !fOk ) {
-    free(cc), cc = NULL;
-  }
+end:
 
-  return cc;
+  CF_DEBUG("LEAVE");
 }
 
-static void * cshell_server_client_thread(void * arg)
+
+/* called by corpc when client sends resource allocation request */
+static void on_smaster_get_resource(corpc_stream * st)
 {
-  int so = (int)(ssize_t)(arg);
+  struct resource_request request = {
+    .ticket = 0,
+    .resource_id = "",
+  };
 
-  struct client_connection * cc = NULL;
+  struct resource_responce responce = {
+    .ticket = 0,
+    .actual_resource_location = ""
+  };
 
-  char msg[1024];
-  ssize_t cb;
+  struct client_context * cc = NULL;
+  corpc_stream * st2 = NULL;
 
-  pthread_detach(pthread_self());
+  char tunip[16] = "";
+  uint16_t port = 0;
 
 
-  /* Check if this client id is allowed and is not already connected,
-   * add to global connectons list
-   * */
-  if ( !(cc = authenticate_connection(so)) ) {
-    CF_FATAL("[so=%d] authenticate_connection() fails", so);
-    goto __end;
+  CF_DEBUG("///////////////////////////////////////////////////////////////////////////");
+  CF_DEBUG("ENTER");
+
+  CF_DEBUG("corpc_stream_read_resource_request()");
+
+  /* proto:  client sends tunip:port as resource ID */
+  if ( !corpc_stream_recv_resource_request(st, &request) ) {
+    CF_FATAL("corpc_stream_read_resource_request() fails");
+    goto end;
   }
 
 
 
-  while ( (cb = so_recv_line(so, msg, sizeof(msg))) > 0 ) {
+  /* search online client with given resource id (actualy tunip) */
 
-    CF_DEBUG("[%d][%s] msg='%s'", so, cc->id, msg);
-
-    if ( strncmp(msg, "RR ", 3 )  == 0 ) {
-
-      int64_t rid = 0;
-      char ipaddrs[256] = "";
-      uint16_t port = 0;
-
-      char responce[256] = "";
-
-      struct client_connection * cc = NULL;
-
-
-      CF_DEBUG("RESOURCE ACCESS REQUESTED");
-
-      if ( sscanf(msg + 3, "%"PRIu64" %255[^:]:%hu", &rid, ipaddrs, &port) != 3 ) {
-        CF_FATAL("APP BUG: Can not parse RR request '%s'", msg);
-        so_sprintf(so, "RRR %"PRIu64" 0.0.0.0:0\n", rid);
-        continue;
-      }
-
-      client_connections_lock();
-
-      if ( !(cc = get_client_connection_tunip(ipaddrs)) ) {
-        CF_FATAL("REQUESTED RESOURCE NOT AVAILABLE: %s", ipaddrs);
-        sprintf(responce, "RRR %"PRIu64" 0.0.0.0:0", rid);
-      }
-      else {
-
-        struct sockaddr_in sin;
-        socklen_t sinlen = sizeof(sin);
-
-        getpeername(cc->so, (struct sockaddr*)&sin, &sinlen);
-
-        sprintf(responce, "RRR %"PRIu64" %s:%u", rid, inet_ntoa(sin.sin_addr), port);
-      }
-
-      client_connections_unlock();
-
-      so_sprintf(so, "%s\n", responce);
-    }
-
+  if ( sscanf(request.resource_id, "%15[^:]:%hu", tunip, &port) < 1 ) {
+    CF_FATAL("invalid resource id requested: '%s'", request.resource_id);
+    goto end;
   }
 
-  CF_NOTICE("Connection lost");
-
-
-__end:
-
-  if ( cc ) {
-
-    client_connections_lock();
-    ccarray_erase_item(&g_client_connections, &cc);
-    client_connections_unlock();
-
-    so_close(cc->so, false);
-    free(cc);
-  }
-  else if ( so != -1 ) {
-    so_close(so, false);
+  if ( !(cc = get_client_connection_tunip(tunip)) ) {
+    CF_FATAL("requested resource '%s' is not available", tunip);
+    goto end;
   }
 
-  return NULL;
+
+  /* proto: smaster generates resource auth ticket and sends request to another client */
+  request.ticket = ((uint64_t) rand()) | (((uint64_t) rand()) << 32);
+
+  CF_DEBUG("st2 = corpc_open_stream()");
+  st2 = corpc_open_stream(cc->channel, &(corpc_open_stream_opts ) {
+        .service = "get_resource",
+        .method = "get_resource"
+      });
+
+  if ( !st2 ) {
+    CF_FATAL("corpc_open_stream(get_resource) fails");
+    goto end;
+  }
+
+  CF_DEBUG("corpc_stream_write_resource_request(st2)");
+  if ( !corpc_stream_send_resource_request(st2, &request) ) {
+    CF_FATAL("corpc_stream_write_resource_request(st2) fails");
+    goto end;
+  }
+
+
+  CF_DEBUG("corpc_stream_recv_resource_request(st2)");
+  if ( !corpc_stream_recv_resource_responce(st2, &responce) ) {
+    CF_FATAL("corpc_stream_write_resource_request(st2) fails");
+    goto end;
+  }
+
+
+  /* proto: smaster send actual ip address of allocate resource (another client) */
+  strcpy(responce.actual_resource_location, cc->realip);
+
+  CF_DEBUG("corpc_stream_send_resource_responce(st)");
+  if ( !corpc_stream_send_resource_responce(st, &responce) ) {
+    CF_FATAL("corpc_stream_write_resource_request(st2) fails");
+    goto end;
+  }
+
+  CF_DEBUG("FINISHED");
+
+end:;
+
+  corpc_close_stream(&st2);
+
+  CF_DEBUG("LEAVE");
+  CF_DEBUG("///////////////////////////////////////////////////////////////////////////");
 }
-
 
 
 int main(int argc, char *argv[])
 {
-  int i;
+  // corpc server
+  corpc_server * server = NULL;
 
-  char saddrs[256] = "0.0.0.0";
-  uint16_t port = 6010;
-  struct sockaddr_in bindaddrs;
-  struct sockaddr_in fromaddrs;
-  socklen_t fromaddrslen = sizeof(fromaddrs);
-
-  int so1, so2;
+  char bindaddrs[256] = "0.0.0.0";
+  uint16_t bindport = 6010;
 
 
+
+  // clients database file name
   char clients_filename[PATH_MAX] = "cshell-clients.cfg";
 
 
   /* configurable flag for background / foreground mode */
   bool daemon_mode = true;
+
+  bool fOk = false;
+
+  int i;
 
   for ( i = 1; i < argc; ++i ) {
 
@@ -400,7 +412,7 @@ int main(int argc, char *argv[])
       if ( ++i >= argc ) {
         fprintf(stderr, "Missing argument after %s command line switch\n", argv[i - 1]);
       }
-      if ( sscanf(argv[i], "%255[^:]:%hu", saddrs, &port) < 1 ) {
+      if ( sscanf(argv[i], "%255[^:]:%hu", bindaddrs, &bindport) < 1 ) {
         fprintf(stderr, "Invalid argument after %s command line switch\n", argv[i - 1]);
         return 1;
       }
@@ -429,13 +441,84 @@ int main(int argc, char *argv[])
     return 1;
   }
 
-  if ( !ccarray_init(&g_client_connections, MAX_CLIENT_CONNECTIONS, sizeof(struct client_connection*)) ) {
+  if ( !ccarray_init(&g_client_connections, MAX_CLIENT_CONNECTIONS, sizeof(struct client_context*)) ) {
     CF_FATAL("ccarray_init(client_connections=%zu) fails: %s", MAX_CLIENT_CONNECTIONS, strerror(errno));
     return 1;
   }
 
 
 
+
+  CF_DEBUG("cf_ssl_initialize()");
+  if ( !cf_ssl_initialize() ) {
+    CF_FATAL("cf_ssl_initialize() fails");
+    return 1;
+  }
+
+  CF_DEBUG("C co_scheduler_init()");
+  if ( !co_scheduler_init(2) ) {
+    CF_FATAL("co_scheduler_init() fails");
+    return 1;
+  }
+
+
+  CF_DEBUG("C corpc_server_new()");
+  server = corpc_server_new(
+      &(struct corpc_server_opts ) {
+        .ssl_ctx = NULL
+      });
+
+  if ( !server ) {
+    CF_FATAL("corpc_server_new() fails");
+    return 1;
+  }
+
+
+  static const corpc_service smaster_service = {
+    .name = "smaster",
+    .methods = {
+      { .name = "authenicate", .proc = on_smaster_authenticate },
+      { .name = "get_resource", .proc = on_smaster_get_resource },
+      { .name = NULL },
+    }
+  };
+
+  static const corpc_service * smaster_services[] = {
+    &smaster_service,
+    NULL
+  };
+
+  CF_DEBUG("corpc_server_add_port()");
+  fOk = corpc_server_add_port(server,
+      &(struct corpc_listening_port_opts ) {
+
+            .listen_address.in = {
+              .sin_family = AF_INET,
+              .sin_addr.s_addr = inet_addr(bindaddrs),
+              .sin_port = htons(bindport),
+              .sin_zero = ""
+            },
+
+            .services = smaster_services,
+
+            .onaccepted = on_client_accepted,
+
+            .ondisconnected = on_client_disconnected
+          });
+
+
+  if ( !fOk ) {
+    CF_FATAL("corpc_server_add_port() fails");
+    return 1;
+  }
+
+  CF_DEBUG("corpc_server_start()");
+  if ( !corpc_server_start(server) ) {
+    CF_FATAL("corpc_server_start() fails");
+    return 1;
+  }
+
+  CF_DEBUG("Server started");
 
   /* fork() and become daemon */
   if ( daemon_mode ) {
@@ -461,28 +544,9 @@ int main(int argc, char *argv[])
     cf_set_logfilename("cshell-server.log");
   }
 
-
-
-  if ( (so1 = so_tcp_listen(saddrs, port, &bindaddrs)) == -1 ) {
-    CF_FATAL("so_tcp_listen() fails: %s", strerror(errno));
-    return 1;
+  while ( 42 ) {
+    sleep(10);
   }
-
-
-  while ( (so2 = accept(so1, (struct sockaddr*) &fromaddrs, &fromaddrslen)) ) {
-
-    pthread_t pid;
-    int status;
-
-    CF_DEBUG("ACCEPTED FROM %s:%u so=%d", inet_ntoa(fromaddrs.sin_addr), ntohs(fromaddrs.sin_port), so2);
-
-    if ( (status = pthread_create(&pid, NULL, cshell_server_client_thread, (void*) (ssize_t) (so2))) ) {
-      CF_FATAL("pthread_create(cshell_server_client_thread) fauls: %s", strerror(status));
-      so_close(so2, true);
-    }
-  }
-
-  close(so1);
 
   return 0;
 }

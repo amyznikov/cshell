@@ -10,7 +10,7 @@
 #include <sys/ioctl.h>
 #include <arpa/inet.h>
 #include "tunnel.h"
-#include "debug.h"
+#include <cuttle/debug.h>
 
 
 /**************************************************************************

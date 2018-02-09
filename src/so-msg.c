@@ -6,7 +6,7 @@
  */
 
 #include "so-msg.h"
-#include "debug.h"
+#include <cuttle/debug.h>
 
 int so_sprintf(int so, const char * format, ...)
 {

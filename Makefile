@@ -8,7 +8,8 @@ ROUTER = cshell-router
 TCPTST = raw-tcp-tester
 
 
-all: $(CLIENT) $(SERVER) $(ROUTER) $(TCPTST)
+all: $(CLIENT) $(SERVER) $(ROUTER) 
+# $(TCPTST)
 
 cross=
 DESTDIR=
@@ -37,12 +38,13 @@ CXXFLAGS=$(CFLAGS)
 # Loader Flags And Libraries
 LD=$(CC)
 LDFLAGS = $(CFLAGS)
+LDLIBS = -L/usr/local/lib -lcuttle -lssl -lcrypto -pthread
+
+# 
 
 
 
-
-
-COMMON_SOURCES = src/debug.c  src/sockopt.c src/so-msg.c 
+COMMON_SOURCES = src/so-msg.c src/corpc-msg.c
 
 CLIENT_SOURCES = $(COMMON_SOURCES) src/cshell-client.c src/tunnel.c src/checksum.c src/ip-pkt.c
 SERVER_SOURCES = $(COMMON_SOURCES) src/cshell-server.c
@@ -60,16 +62,16 @@ INCLUDES += -Isrc
 
 
 $(CLIENT): $(CLIENT_MODULES)
-	$(LD) $(LDFLAGS) $(CLIENT_MODULES) -pthread -o $@
+	$(LD) $(LDFLAGS) $(CLIENT_MODULES) $(LDLIBS) -o $@
 
 $(SERVER): $(SERVER_MODULES)
-	$(LD) $(LDFLAGS) $(SERVER_MODULES) -pthread -o $@
+	$(LD) $(LDFLAGS) $(SERVER_MODULES) $(LDLIBS) -o $@
 
 $(ROUTER): $(ROUTER_MODULES)
-	$(LD) $(LDFLAGS) $(ROUTER_MODULES) -o $@
+	$(LD) $(LDFLAGS) $(ROUTER_MODULES) $(LDLIBS) -o $@
 
 $(TCPTST): $(TCPTST_MODULES)
-	$(LD) $(LDFLAGS) $(TCPTST_MODULES) -pthread -o $@
+	$(LD) $(LDFLAGS) $(TCPTST_MODULES) $(LDLIBS) -o $@
 
 clean:
 	$(RM) src/*.o

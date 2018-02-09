@@ -230,17 +230,15 @@ static int microsrv_accept(void * arg, uint32_t events)
 {
   (void)(events);
 
-  int so1 = (int) (ssize_t) (arg);
-  int so2;
+  int so1, so2;
+
+  so1 = (int) (ssize_t) (arg);
 
   // fixme for cuttle: EPOLLET
   while ( (so2 = accept(so1, NULL, NULL)) != -1 ) {
-
     if ( !co_schedule(microsrv_thread, (void*) (ssize_t) (so2), 1024 * 1024) ) {
       CF_FATAL("co_schedule(microsrv_client_thread) fails");
-      CF_DEBUG("so_close(so, true)");
       so_close(so2, true);
-      CF_DEBUG("R so_close(so, true)");
     }
   }
 
@@ -252,7 +250,7 @@ static bool start_microsrv(const char * listen_addrs, uint16_t listen_port,
     /* out, opt */ struct sockaddr_in * bound_addrs)
 {
   if ( (g_microsrvfd = so_tcp_listen(listen_addrs, listen_port, bound_addrs)) == -1 ) {
-    CF_FATAL("so_tcp_listen(bindaddrs=%s:6001) fails", g_tunip);
+    CF_FATAL("so_tcp_listen(bindaddrs=%s:%u) fails", listen_addrs, listen_port);
     return false;
   }
 
@@ -271,13 +269,129 @@ static bool start_microsrv(const char * listen_addrs, uint16_t listen_port,
 
 // SIDE B
 
-static void microclient_thread(const char * addrs, uint16_t port)
+struct authtoken {
+  uint64_t ticket;
+};
+
+static ccarray_t g_authtokens; // <struct authtoken>
+
+static bool push_auth_tocken(uint64_t ticket)
 {
+  if ( ccarray_size(&g_authtokens) >= ccarray_capacity(&g_authtokens) ) {
+    CF_FATAL("TOO MANY TOKENS");
+    return false;
+  }
+
+  ccarray_push_back(&g_authtokens, &(struct authtoken ) {
+        .ticket = ticket
+      });
+
+  return true;
+}
+
+static bool pop_auth_tocken(uint64_t ticket, struct authtoken * token)
+{
+  size_t i, n;
+  const struct authtoken * t;
+  for ( i = 0, n = ccarray_size(&g_authtokens); i < n; ++i ) {
+    if ( (t = ccarray_peek(&g_authtokens, i))->ticket == ticket ) {
+      memcpy(token, t, sizeof(*t));
+      ccarray_erase(&g_authtokens, i);
+      return true;
+    }
+  }
+  return false;
+}
+
+static void micro_client_thread(void * arg)
+{
+  struct sockaddr_in addrs;
+  socklen_t addrssize = sizeof(addrs);
+
+  struct authtoken token;
+  int so1 = -1, so2 = -1;
+
+//  char buf[1024] = "";
+
+  so1 = (int)(ssize_t)(arg);
+
+  getpeername(so1, (struct sockaddr*) &addrs, &addrssize);
+
+  CF_NOTICE("ACCEPTED FROM %s:%u", inet_ntoa(addrs.sin_addr), ntohs(addrs.sin_port));
+
+  so_set_non_blocking(so1, true);
+  so_set_recv_timeout(so1, 10);
+
+  if ( co_recv(so1, &token.ticket, sizeof(token.ticket), 0) != sizeof(token.ticket) ) {
+    CF_FATAL("Can not read auth ticket, abort connection");
+    goto end;
+  }
+
+  if ( !pop_auth_tocken(token.ticket, &token) ) {
+    CF_FATAL("Inalid ticket received=%llu, abort connection", (unsigned long long )token.ticket);
+    goto end;
+  }
+
+  CF_DEBUG("AUTH TICKET=%llu", (unsigned long long )token.ticket);
+
+  // make connection to internal (hidden) actual web service
+  if ( (so2 = so_tcp_connect2("127.0.0.1", 80)) == -1 ) {
+    CF_FATAL("so_tcp_connect() fails, abort connection");
+    goto end;
+  }
+
+  CF_NOTICE("ESTABLISHED");
+
+  // start data exchange
+
+end:
+
+  if ( so1 != -1 ) {
+    so_close(so1, false);
+  }
+
+  if ( so2 != -1 ) {
+    so_close(so1, false);
+  }
+}
 
 
 
-  //int so = so_tcp_connect2("127.0.0.1", port);
+static int micro_client_accept(void * arg, uint32_t events)
+{
+  (void)(events);
 
+  int so1, so2;
+
+  so1 = (int) (ssize_t) (arg);
+
+  // fixme for cuttle: EPOLLET
+  while ( (so2 = accept(so1, NULL, NULL)) != -1 ) {
+    if ( !co_schedule(micro_client_thread, (void*) (ssize_t) (so2), 1024 * 1024) ) {
+      CF_FATAL("co_schedule(micro_client_thread) fails");
+      so_close(so2, true);
+    }
+  }
+
+  return 0;
+}
+
+static bool start_micro_client_server(const char * listen_address, uint16_t listen_port)
+{
+  int so;
+
+  if ( (so = so_tcp_listen(listen_address, listen_port, NULL)) == -1 ) {
+    CF_FATAL("so_tcp_listen(bindaddrs=%s:%u) fails", listen_address, listen_port);
+    return false;
+  }
+
+  so_set_non_blocking(so, 1);
+  if ( !co_schedule_io(so, EPOLLIN, micro_client_accept, (void *) (ssize_t) (so), 1024 * 1024) ) {
+    CF_FATAL("co_schedule_io(micro_client_accept) fails: %s", strerror(errno));
+    return false;
+  }
+
+  return true;
 }
 
 
@@ -487,9 +601,7 @@ int main(int argc, char *argv[])
   /* configurable flag for background / foreground mode */
   bool daemon_mode = true;
 
-
   int tunfd = -1;
-  int microsrvfd = -1;
 
 
   int i;
@@ -628,6 +740,11 @@ int main(int argc, char *argv[])
 
 
   // Schedule services micro stubs
+  if ( !start_micro_client_server("0.0.0.0", 80) ) {
+    CF_FATAL("start_micro_client_server() fails: %s", strerror(errno));
+    return 1;
+  }
+
 
 
 

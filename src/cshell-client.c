@@ -66,9 +66,73 @@ static const char g_node[] = "/dev/net/tun";
 static int g_microsrvfd = -1;
 struct sockaddr_in g_microsrv_bind_address;
 
+// IP addrs pf physical eth device
+char g_phys_addrs[16] = "";
+uint16_t g_phys_port = 80;
+
 
 /////////////////////////////////////////////////////////////////////////////
 
+struct so_ddx_thread_arg {
+  int src, dst;
+  bool finished;
+};
+
+static int co_ddx_thread(void * arg, uint32_t events)
+{
+  struct so_ddx_thread_arg * ddxarg = arg;
+  char buf[4 * 1024];
+  ssize_t cb;
+
+  if ( events & EPOLLERR ) {
+    ddxarg->finished = true;
+  }
+  else {
+    while ( (cb = recv(ddxarg->src, buf, sizeof(buf), 0)) > 0 ) {
+      if ( (cb = co_send(ddxarg->dst, buf, cb, 0)) < 0 ) {
+        ddxarg->finished = true;
+        break;
+      }
+    }
+  }
+
+  if ( ddxarg->finished ) {
+    return -1;
+  }
+
+  return 0;
+}
+
+static bool co_ddx(int so1, int so2)
+{
+  struct so_ddx_thread_arg arg1 = {
+    .src = so1,
+    .dst = so2,
+    .finished = false
+  };
+
+  struct so_ddx_thread_arg arg2 = {
+    .src = so2,
+    .dst = so1,
+    .finished = false
+  };
+
+  if ( !co_schedule_io(so1, EPOLLIN, co_ddx_thread, &arg1, 16 * 1024) ) {
+    CF_FATAL("co_schedule_io(co_ddx_thread) fails");
+    return false;
+  }
+
+  if ( !co_schedule_io(so2, EPOLLIN, co_ddx_thread, &arg2, 16 * 1024) ) {
+    CF_FATAL("co_schedule_io(co_ddx_thread) fails");
+    return false;
+  }
+
+  while ( !arg1.finished && !arg2.finished ) {
+    co_sleep(500);
+  }
+
+  return true;
+}
 
 
 /////////////////////////////////////////////////////////////////////////////
@@ -127,6 +191,8 @@ static bool get_actual_resource_location(const struct sockaddr_in * addrs,
     goto __end;
   }
 
+  CF_DEBUG("GOT TICKET FROM MASTER = %llu", (unsigned long long ) responce.ticket);
+
   *ticket = responce.ticket;
   strncpy(actual_resource_location, responce.actual_resource_location, SM_MAX_ACTUAL_RESOURCE_ADDRESS);
 
@@ -147,8 +213,11 @@ __end:
 
 /////////////////////////////////////////////////////////////////////////////
 
+
+
+
 // called from microsrv_accept()
-static void microsrv_thread(void * arg)
+static void micro_server_thread(void * arg)
 {
   struct sockaddr_in addrs;
   socklen_t addrssize = sizeof(addrs);
@@ -159,13 +228,14 @@ static void microsrv_thread(void * arg)
 
   char buf[1024] = "";
 
-  co_ssl_socket * sslsock2 = NULL;
+  int so1 = -1, so2 = -1;
 
-  int so1 = (int)(ssize_t)(arg);
+  so1 = (int)(ssize_t)(arg);
+
+  bool fOk = false;
 
 
   getpeername(so1, (struct sockaddr*) &addrs, &addrssize);
-  so_set_non_blocking(so1, true);
 
   CF_NOTICE("ACCEPTED FROM %s:%u", inet_ntoa(addrs.sin_addr), ntohs(addrs.sin_port));
 
@@ -191,42 +261,55 @@ static void microsrv_thread(void * arg)
 
   so_sockaddr_in(actual_resource_location, ntohs(item->dst.sin_port), &addrs);
 
-  if ( !(sslsock2 = co_ssl_socket_connect_new((struct sockaddr*) &addrs, NULL, SOCK_STREAM, IPPROTO_TCP, 10 * 1000)) ) {
-    CF_FATAL("co_ssl_socket_connect_new(%s:%u) fails", inet_ntoa(addrs.sin_addr), ntohs(addrs.sin_port));
+  if ( (so2 = co_tcp_connect((struct sockaddr*) &addrs, sizeof(addrs), 10)) == -1 ) {
+    CF_FATAL("co_tcp_connect(%s:%u) fails", inet_ntoa(addrs.sin_addr), ntohs(addrs.sin_port));
     sprintf(buf, "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/html; charset=ISO-8859-1\r\n"
         "\r\n"
-        "<HTML><H1>co_ssl_socket_connect_new(%s:%u) fails</H1></HTML>\r\n",
-        inet_ntoa(addrs.sin_addr), ntohs(addrs.sin_port));
+        "<HTML><H1>co_tcp_connect(%s:%u) fails</H1></HTML>\r\n",
+          inet_ntoa(addrs.sin_addr), ntohs(addrs.sin_port));
     goto end;
   }
 
 
+  // send auth ticket
 
-  sprintf(buf, "HTTP/1.1 200 OK\r\n"
-      "Content-Type: text/html; charset=ISO-8859-1\r\n"
-      "\r\n"
-      "<HTML><H1>get_actual_resource_location() OK</H1></HTML>"
-      "<p>ticket=%llu</p>"
-      "<p>IP ADDRS=%s</p>"
-      "\r\n",
-      (unsigned long long)ticket,
-      actual_resource_location );
+  CF_DEBUG("Send auth.ticket=%llu", (unsigned long long ) ticket);
 
+  if ( !co_send(so2, &ticket, sizeof(ticket), 0) ) {
+    CF_FATAL("co_send(ticket) fails");
+    sprintf(buf, "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html; charset=ISO-8859-1\r\n"
+        "\r\n"
+        "<HTML><H1>co_send(ticket) fails</H1></HTML>\r\n");
+    goto end;
+  }
+
+
+  fOk = true;
+
+  if ( !co_ddx(so1, so2) ) {
+    CF_FATAL("co_ddx() fails");
+  }
 
 end:
 
-  if ( sslsock2 ) {
-    co_ssl_socket_destroy(&sslsock2, false);
+  if ( !fOk ) {
+    co_send(so1, buf, strlen(buf), 0);
   }
 
-  co_send(so1, buf, strlen(buf), 0);
-  so_close(so1, false);
+  if ( so1 != -1 ) {
+    so_close(so1, false);
+  }
+
+  if ( so2 != -1 ) {
+    so_close(so2, false);
+  }
 }
 
 
-// called from start_microsrv()
-static int microsrv_accept(void * arg, uint32_t events)
+// called from start_micro_server()
+static int micro_server_accept(void * arg, uint32_t events)
 {
   (void)(events);
 
@@ -234,11 +317,18 @@ static int microsrv_accept(void * arg, uint32_t events)
 
   so1 = (int) (ssize_t) (arg);
 
+  if ( events & EPOLLERR ) {
+    CF_FATAL("FATAL : EPOLLERR");
+    so_close(so1, false);
+    return 1;
+  }
+
   // fixme for cuttle: EPOLLET
   while ( (so2 = accept(so1, NULL, NULL)) != -1 ) {
-    if ( !co_schedule(microsrv_thread, (void*) (ssize_t) (so2), 1024 * 1024) ) {
+    so_set_non_blocking(so2, true);
+    if ( !co_schedule(micro_server_thread, (void*) (ssize_t) (so2), 1024 * 1024) ) {
       CF_FATAL("co_schedule(microsrv_client_thread) fails");
-      so_close(so2, true);
+      so_close(so2, false);
     }
   }
 
@@ -246,7 +336,7 @@ static int microsrv_accept(void * arg, uint32_t events)
 }
 
 // calls microsrv_accept() for new incoming connection
-static bool start_microsrv(const char * listen_addrs, uint16_t listen_port,
+static bool start_micro_server(const char * listen_addrs, uint16_t listen_port,
     /* out, opt */ struct sockaddr_in * bound_addrs)
 {
   if ( (g_microsrvfd = so_tcp_listen(listen_addrs, listen_port, bound_addrs)) == -1 ) {
@@ -254,8 +344,8 @@ static bool start_microsrv(const char * listen_addrs, uint16_t listen_port,
     return false;
   }
 
-  so_set_non_blocking(g_microsrvfd, 1);
-  if ( !co_schedule_io(g_microsrvfd, EPOLLIN, microsrv_accept, (void *) (ssize_t) (g_microsrvfd), 1024 * 1024) ) {
+  so_set_non_blocking(g_microsrvfd, true);
+  if ( !co_schedule_io(g_microsrvfd, EPOLLIN, micro_server_accept, (void *) (ssize_t) (g_microsrvfd), 1024 * 1024) ) {
     CF_FATAL("co_schedule_io(microsrv_accept) fails: %s", strerror(errno));
     return false;
   }
@@ -277,10 +367,19 @@ static ccarray_t g_authtokens; // <struct authtoken>
 
 static bool push_auth_tocken(uint64_t ticket)
 {
+  if ( ccarray_capacity(&g_authtokens) < 1 ) {
+    if ( !ccarray_init(&g_authtokens, 1000, sizeof(struct authtoken)) ) {
+      CF_FATAL("ccarray_init(g_authtokens) fails");
+      return false;
+    }
+  }
+
+
   if ( ccarray_size(&g_authtokens) >= ccarray_capacity(&g_authtokens) ) {
     CF_FATAL("TOO MANY TOKENS");
     return false;
   }
+
 
   ccarray_push_back(&g_authtokens, &(struct authtoken ) {
         .ticket = ticket
@@ -289,13 +388,15 @@ static bool push_auth_tocken(uint64_t ticket)
   return true;
 }
 
-static bool pop_auth_tocken(uint64_t ticket, struct authtoken * token)
+static bool search_auth_tocken(uint64_t ticket, struct authtoken * token)
 {
   size_t i, n;
   const struct authtoken * t;
   for ( i = 0, n = ccarray_size(&g_authtokens); i < n; ++i ) {
     if ( (t = ccarray_peek(&g_authtokens, i))->ticket == ticket ) {
-      memcpy(token, t, sizeof(*t));
+      if ( token ) {
+        memcpy(token, t, sizeof(*t));
+      }
       ccarray_erase(&g_authtokens, i);
       return true;
     }
@@ -312,6 +413,7 @@ static void micro_client_thread(void * arg)
   int so1 = -1, so2 = -1;
 
 //  char buf[1024] = "";
+  ssize_t cb;
 
   so1 = (int)(ssize_t)(arg);
 
@@ -319,23 +421,26 @@ static void micro_client_thread(void * arg)
 
   CF_NOTICE("ACCEPTED FROM %s:%u", inet_ntoa(addrs.sin_addr), ntohs(addrs.sin_port));
 
-  so_set_non_blocking(so1, true);
   so_set_recv_timeout(so1, 10);
 
-  if ( co_recv(so1, &token.ticket, sizeof(token.ticket), 0) != sizeof(token.ticket) ) {
-    CF_FATAL("Can not read auth ticket, abort connection");
+  if ( (cb = co_recv(so1, &token.ticket, sizeof(token.ticket), 0)) != sizeof(token.ticket) ) {
+    CF_FATAL("Can not read auth ticket, abort connection. cb=%zd", cb);
     goto end;
   }
 
-  if ( !pop_auth_tocken(token.ticket, &token) ) {
+  CF_DEBUG("RECEIVED AUTH TICKET=%llu", (unsigned long long )token.ticket);
+
+  if ( !search_auth_tocken(token.ticket, &token) ) {
     CF_FATAL("Inalid ticket received=%llu, abort connection", (unsigned long long )token.ticket);
     goto end;
   }
 
-  CF_DEBUG("AUTH TICKET=%llu", (unsigned long long )token.ticket);
+  CF_DEBUG("POP-ED AUTH TICKET=%llu", (unsigned long long )token.ticket);
 
-  // make connection to internal (hidden) actual web service
-  if ( (so2 = so_tcp_connect2("127.0.0.1", 80)) == -1 ) {
+
+  // make connection to actual internal (hidden) web service
+  so_sockaddr_in(g_tunip, 80, &addrs);
+  if ( (so2 = co_tcp_connect((struct sockaddr*) &addrs, sizeof(addrs), 5)) == -1 ) {
     CF_FATAL("so_tcp_connect() fails, abort connection");
     goto end;
   }
@@ -343,6 +448,10 @@ static void micro_client_thread(void * arg)
   CF_NOTICE("ESTABLISHED");
 
   // start data exchange
+  if ( !co_ddx(so1,  so2) ) {
+    CF_FATAL("co_ddx() fails");
+  }
+
 
 end:
 
@@ -365,11 +474,18 @@ static int micro_client_accept(void * arg, uint32_t events)
 
   so1 = (int) (ssize_t) (arg);
 
+  if ( events & EPOLLERR ) {
+    CF_FATAL("FATAL : EPOLLERR");
+    so_close(so1, false);
+    return 1;
+  }
+
   // fixme for cuttle: EPOLLET
   while ( (so2 = accept(so1, NULL, NULL)) != -1 ) {
+    so_set_non_blocking(so2, true);
     if ( !co_schedule(micro_client_thread, (void*) (ssize_t) (so2), 1024 * 1024) ) {
       CF_FATAL("co_schedule(micro_client_thread) fails");
-      so_close(so2, true);
+      so_close(so2, false);
     }
   }
 
@@ -439,11 +555,15 @@ static void on_smaster_get_resource_requested(corpc_stream * st)
   responce.ticket = request.ticket;
   sprintf(responce.actual_resource_location, "%u", port);
 
+  push_auth_tocken(responce.ticket);
+
   CF_DEBUG("corpc_stream_send_resource_responce(st)");
   if ( !corpc_stream_send_resource_responce(st, &responce) ) {
     CF_FATAL("corpc_stream_write_resource_request(st2) fails");
+    search_auth_tocken(responce.ticket, NULL); // fixme: hack - this actually removes the ticket from list
     goto end;
   }
+
 
   CF_DEBUG("RESPONE SENT");
 
@@ -608,6 +728,8 @@ int main(int argc, char *argv[])
 
 
 
+
+
   /* parse command line */
   for ( i = 1; i < argc; ++i ) {
 
@@ -659,6 +781,19 @@ int main(int argc, char *argv[])
     }
 
     //////////////////////////////////////////////////////////////////////////////////////////////
+    else if ( strcmp(argv[i], "--phys") == 0 ) {
+      if ( ++i >= argc ) {
+        fprintf(stderr, "Missing argument after %s command line switch\n", argv[i - 1]);
+        return 1;
+      }
+
+      if ( sscanf(argv[i], "%255[^:]:%hu", g_phys_addrs, &g_phys_port) < 1 ) {
+        fprintf(stderr, "Invalid argument after %s command line switch\n", argv[i - 1]);
+        return 1;
+      }
+    }
+
+    //////////////////////////////////////////////////////////////////////////////////////////////
     else if ( strcmp(argv[i], "--iface") == 0 ) {
       if ( ++i >= argc ) {
         fprintf(stderr, "Missing argument after %s command line switch\n", argv[i - 1]);
@@ -673,6 +808,12 @@ int main(int argc, char *argv[])
       return 1;
     }
   }
+
+  if ( !*g_phys_addrs || !g_phys_port ) {
+    fprintf(stderr, "--phys not specified or invalid\n");
+    return 1;
+  }
+
 
   cf_set_logfilename("stderr");
   cf_set_loglevel(CF_LOG_DEBUG);
@@ -708,6 +849,7 @@ int main(int argc, char *argv[])
 
 
 
+
   // Open tunnel and assign received tunip address */
 
   CF_DEBUG("open_tunnel(node=%s, tuniface=%s, tunip=%s, ifacemask=%s, ifaceflags=0x%0X)",
@@ -727,7 +869,7 @@ int main(int argc, char *argv[])
 
 
   // Schedule internal micro tcp server
-  if ( !start_microsrv(g_tunip, 6001, &g_microsrv_bind_address) ) {
+  if ( !start_micro_server(g_tunip, 6001, &g_microsrv_bind_address) ) {
     CF_FATAL("start_microsrv(%s:6001) fails", g_tunip);
     return 1;
   }
@@ -740,7 +882,7 @@ int main(int argc, char *argv[])
 
 
   // Schedule services micro stubs
-  if ( !start_micro_client_server("0.0.0.0", 80) ) {
+  if ( !start_micro_client_server(g_phys_addrs, g_phys_port) ) {
     CF_FATAL("start_micro_client_server() fails: %s", strerror(errno));
     return 1;
   }

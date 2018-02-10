@@ -8,11 +8,13 @@
 #include <unistd.h>
 #include <cuttle/debug.h>
 #include <cuttle/ccarray.h>
+#include <cuttle/sockopt.h>
 #include <cuttle/cothread/scheduler.h>
 #include <arpa/inet.h>
 #include "rdtun.h"
 #include "checksum.h"
 #include "ip-pkt.h"
+
 
 
 static ccarray_t rtable; /* <struct rtable_item> */
@@ -89,7 +91,13 @@ static int cordtun(void * arg, uint32_t events)
   ssize_t cb;
   const struct rtable_item * item;
 
-  CF_DEBUG("ENTER. EVEBTS = 0x%0X", events);
+  CF_DEBUG("***********************\n"
+      "ENTER. EVENTS = 0x%0X", events);
+
+  if ( events & EPOLLERR ) {
+    CF_FATAL("FATAL EPOLLERR ENCOUNTERED!!!");
+  }
+
   while ( (pktsize = read(tunfd, pktbuf, sizeof(pktbuf))) > 0 ) {
 
     CF_DEBUG("parsepkt");
@@ -137,10 +145,13 @@ static int cordtun(void * arg, uint32_t events)
 
     // dumppkt("W", ip, iphsize, tcp, tcphsize, tcppld, pldsize);
 
-    if ( (cb = co_write(tunfd, ip, ntohs(ip->ip_len))) <= 0 ) {
+    //if ( (cb = co_write(tunfd, ip, ntohs(ip->ip_len))) <= 0 ) {
+    if ( (cb = write(tunfd, ip, ntohs(ip->ip_len))) <= 0 ) {
       CF_FATAL("write(tunfd) fails: %s", strerror(errno));
     }
   }
+
+  CF_DEBUG("LEAVE\n==================");
 
   return 0;
 }

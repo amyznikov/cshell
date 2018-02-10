@@ -458,7 +458,7 @@ int main(int argc, char *argv[])
   }
 
   CF_DEBUG("C co_scheduler_init()");
-  if ( !co_scheduler_init(2) ) {
+  if ( !co_scheduler_init(1) ) {
     CF_FATAL("co_scheduler_init() fails");
     return 1;
   }

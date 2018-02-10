@@ -22,13 +22,13 @@ extern "C" {
 
 
 struct rtable_item {
-  struct sockaddr_in src, dst, resp;
+  struct sockaddr_in src, dst, rsp;
 };
 
 
-bool start_rdtun_cothread(int tunfd, const struct sockaddr_in * microsrv_bind_address);
+bool start_rdtun(int tunfd, const struct sockaddr_in * microsrv_bind_address);
 
-struct rtable_item * rtable_get_resp(struct in_addr addr, in_port_t port);
+struct rtable_item * rtable_get_rsp(struct in_addr addr, in_port_t port);
 
 #ifdef __cplusplus
 }

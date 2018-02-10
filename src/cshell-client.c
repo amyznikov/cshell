@@ -64,7 +64,7 @@ static const char g_node[] = "/dev/net/tun";
 
 
 static int g_microsrvfd = -1;
-struct sockaddr_in g_microsrv_bind_address;
+struct sockaddr_in g_tcp_dst_address;
 
 // IP addrs pf physical eth device
 char g_phys_addrs[16] = "";
@@ -81,7 +81,7 @@ struct so_ddx_thread_arg {
 static int co_ddx_thread(void * arg, uint32_t events)
 {
   struct so_ddx_thread_arg * ddxarg = arg;
-  char buf[4 * 1024];
+  char buf[8 * 1024];
   ssize_t cb;
 
   if ( events & EPOLLERR ) {
@@ -239,7 +239,7 @@ static void micro_server_thread(void * arg)
 
   CF_NOTICE("ACCEPTED FROM %s:%u", inet_ntoa(addrs.sin_addr), ntohs(addrs.sin_port));
 
-  if ( !(item = rtable_get_resp(addrs.sin_addr, addrs.sin_port)) ) {
+  if ( !(item = rtable_get_rsp(addrs.sin_addr, addrs.sin_port)) ) {
     sprintf(buf, "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/html; charset=ISO-8859-1\r\n"
         "\r\n"
@@ -334,7 +334,7 @@ static int micro_server_accept(void * arg, uint32_t events)
     }
   }
 
-  CF_DEBUG("micro_server_accept: LEAVE", events);
+  CF_DEBUG("micro_server_accept: LEAVE");
 
   return 0;
 }
@@ -349,7 +349,7 @@ static bool start_micro_server(const char * listen_addrs, uint16_t listen_port,
   }
 
   so_set_non_blocking(g_microsrvfd, true);
-  if ( !co_schedule_io(g_microsrvfd, EPOLLIN, micro_server_accept, (void *) (ssize_t) (g_microsrvfd), 1024 * 1024) ) {
+  if ( !co_schedule_io(g_microsrvfd, EPOLLIN, micro_server_accept, (void *) (ssize_t) (g_microsrvfd), 256 * 1024) ) {
     CF_FATAL("co_schedule_io(microsrv_accept) fails: %s", strerror(errno));
     return false;
   }
@@ -416,7 +416,6 @@ static void micro_client_thread(void * arg)
   struct authtoken token;
   int so1 = -1, so2 = -1;
 
-//  char buf[1024] = "";
   ssize_t cb;
 
   so1 = (int)(ssize_t)(arg);
@@ -442,7 +441,7 @@ static void micro_client_thread(void * arg)
   CF_DEBUG("POP-ED AUTH TICKET=%llu", (unsigned long long )token.ticket);
 
 
-  // make connection to actual internal (hidden) web service
+  // fixme: make connection to actual internal (hidden) web service
   so_sockaddr_in(g_tunip, 80, &addrs);
   if ( (so2 = co_tcp_connect((struct sockaddr*) &addrs, sizeof(addrs), 5)) == -1 ) {
     CF_FATAL("so_tcp_connect() fails, abort connection");
@@ -506,7 +505,7 @@ static bool start_micro_client_server(const char * listen_address, uint16_t list
   }
 
   so_set_non_blocking(so, 1);
-  if ( !co_schedule_io(so, EPOLLIN, micro_client_accept, (void *) (ssize_t) (so), 1024 * 1024) ) {
+  if ( !co_schedule_io(so, EPOLLIN, micro_client_accept, (void *) (ssize_t) (so), 256 * 1024) ) {
     CF_FATAL("co_schedule_io(micro_client_accept) fails: %s", strerror(errno));
     return false;
   }
@@ -653,6 +652,7 @@ static void master_authenticate(void * arg)
 
   bool fOk = false;
 
+  CF_DEBUG("ENTER");
 
   if ( !create_master_channel() ) {
     CF_FATAL("create_master_channel() fails");
@@ -824,23 +824,27 @@ int main(int argc, char *argv[])
 
 
 
+  CF_DEBUG("cf_ssl_initialize()");
   if ( !cf_ssl_initialize() ) {
     CF_FATAL("cf_ssl_initialize() fails: %s", strerror(errno));
     return 1;
   }
 
-  if ( !co_scheduler_init(2) ) {
+  CF_DEBUG("co_scheduler_init(1)");
+  if ( !co_scheduler_init(1) ) {
     CF_FATAL("co_scheduler_init() fails: %s", strerror(errno));
     return 1;
   }
 
   // start smaster authentication, results in opened smaster channel and retrived tunip
+  CF_DEBUG("co_schedule(master_authenticate()");
   if ( !co_schedule(master_authenticate, NULL, 1024 * 1024) ) {
     CF_FATAL("co_schedule(master_authenticate) fails: %s", strerror(errno));
     return 1;
   }
 
   // Wait util authentication finished
+  CF_DEBUG("while ( !g_auth_finished )");
   while ( !g_auth_finished ) {
     co_sleep(500);
   }
@@ -873,19 +877,22 @@ int main(int argc, char *argv[])
 
 
   // Schedule internal micro tcp server
-  if ( !start_micro_server(g_tunip, 6001, &g_microsrv_bind_address) ) {
+  CF_DEBUG("start_micro_server()");
+  if ( !start_micro_server(g_tunip, 6001, &g_tcp_dst_address) ) {
     CF_FATAL("start_microsrv(%s:6001) fails", g_tunip);
     return 1;
   }
 
   // Schedule tunnel ip forwarding
-  if ( !start_rdtun_cothread(tunfd, &g_microsrv_bind_address) ) {
+  CF_DEBUG("start_rdtun_cothread()");
+  if ( !start_rdtun(tunfd, &g_tcp_dst_address) ) {
     CF_FATAL("start_rdtun_cothread(tunfd=-1) fails: %s", strerror(errno));
     return 1;
   }
 
 
   // Schedule services micro stubs
+  CF_DEBUG("start_micro_client_server()");
   if ( !start_micro_client_server(g_phys_addrs, g_phys_port) ) {
     CF_FATAL("start_micro_client_server() fails: %s", strerror(errno));
     return 1;
@@ -897,6 +904,7 @@ int main(int argc, char *argv[])
 
 
   /* fork() and become daemon */
+  CF_DEBUG("if ( daemon_mode )");
   if ( daemon_mode ) {
 
     pid_t pid;
@@ -920,6 +928,8 @@ int main(int argc, char *argv[])
     cf_set_logfilename("cshell-client.log");
   }
 
+
+  CF_DEBUG("co_sleep()");
 
   while ( 42 ) {
     co_sleep(100000);

@@ -324,6 +324,8 @@ static int micro_server_accept(void * arg, uint32_t events)
   }
 
   // fixme for cuttle: EPOLLET
+  CF_DEBUG("micro_server_accept: EVENTS=0x%0x", events);
+
   while ( (so2 = accept(so1, NULL, NULL)) != -1 ) {
     so_set_non_blocking(so2, true);
     if ( !co_schedule(micro_server_thread, (void*) (ssize_t) (so2), 1024 * 1024) ) {
@@ -331,6 +333,8 @@ static int micro_server_accept(void * arg, uint32_t events)
       so_close(so2, false);
     }
   }
+
+  CF_DEBUG("micro_server_accept: LEAVE", events);
 
   return 0;
 }

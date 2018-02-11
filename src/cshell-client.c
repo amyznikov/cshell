@@ -99,6 +99,7 @@ static void co_ddx_thread(void * arg)
       CF_FATAL("co_send() fails: cbr=%zd cbs=%zd errno=%s", cbr, cbs, strerror(errno));
       break;
     }
+    co_yield();
   }
 
   ddxarg->finished = true;
@@ -144,7 +145,7 @@ static bool co_ddx(int so1, int so2)
   }
 
   while ( !arg1.finished || !arg2.finished ) {
-    CF_DEBUG("REMOVE ME AFTER DEBUG: co_sleep(1000)");
+    CF_DEBUG("REPLACE ME WITH co_join() AFTER DEBUG");
     co_sleep(1000);
   }
 

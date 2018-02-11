@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -18,18 +19,17 @@
 
 #include <cuttle/pthread_wait.h>
 #include <cuttle/sockopt.h>
+#include <cuttle/iface.h>
 #include <cuttle/ccarray.h>
 #include <cuttle/corpc/server.h>
 #include <cuttle/ssl/init-ssl.h>
 #include <cuttle/debug.h>
+#include <cuttle/opts.h>
 
 #include "tunnel.h"
 #include "rdtun.h"
-//#include "checksum.h"
-//#include "ip-pkt.h"
-//#include "epoll-ctl.h"
-//#include "so-msg.h"
 #include "smaster.h"
+#include "services.h"
 
 
 #ifndef CSHELL_VERSION
@@ -37,7 +37,7 @@
 #endif
 
 
-#define CO_STACK_SIZE   (64*1024*1024)
+#define CO_STACK_SIZE   (8*1024*1024)
 
 static const char VERSION[] = CSHELL_VERSION;
 
@@ -45,6 +45,7 @@ static corpc_channel * g_smaster_channel;
 static char g_master_server_ip[256] = "";
 static uint16_t g_master_server_port = 6010;
 static bool g_auth_finished = false;
+
 
 
 // id of this client, must be registered on master server
@@ -72,6 +73,14 @@ static struct sockaddr_in g_micro_tcp_server_bind_address;
 // IP addrs pf physical eth device
 static char g_phys_addrs[16] = "";
 static uint16_t g_phys_port = 80;
+
+
+// patname to cshell-client config file
+static char g_config_file_name[PATH_MAX] = "";
+
+
+// patname to services table
+static char g_services_table_pathname[PATH_MAX] = "";
 
 
 /////////////////////////////////////////////////////////////////////////////
@@ -343,7 +352,7 @@ static int micro_server_accept(void * arg, uint32_t events)
   if ( events & EPOLLERR ) {
     CF_FATAL("FATAL : EPOLLERR");
     so_close(so1, false);
-    return 1;
+    return -1;
   }
 
   // fixme for cuttle: EPOLLET
@@ -431,53 +440,81 @@ static bool search_auth_tocken(uint64_t ticket, struct authtoken * token)
   return false;
 }
 
-static void micro_client_thread(void * arg)
+////////////////////////////////////////////////////////////////////////////////////
+
+struct micro_tcp_thread_arg {
+  const struct services_table_item * service;
+  int so;
+};
+
+static void micro_tcp_thread(void * arg)
 {
+  struct micro_tcp_thread_arg * args = arg;
+  const struct services_table_item * service = args->service;
+  int so1 = args->so, so2 = -1;
+
   struct sockaddr_in addrs;
   socklen_t addrssize = sizeof(addrs);
 
   struct authtoken token;
-  int so1 = -1, so2 = -1;
-
   ssize_t cb;
 
-  so1 = (int)(ssize_t)(arg);
+  char connect_address[64] = "";
+  uint16_t connect_port = 0;
+
+  free(args), args = NULL;
+
 
   getpeername(so1, (struct sockaddr*) &addrs, &addrssize);
-
   CF_NOTICE("ACCEPTED FROM %s:%u", inet_ntoa(addrs.sin_addr), ntohs(addrs.sin_port));
 
   so_set_recv_timeout(so1, 10);
+
+
+
+  sscanf(service->connect_addr, "%63[^:]:%hu", connect_address, &connect_port);
+  if ( connect_port == 0 ) {
+    CF_FATAL("Invalid connect port specified for service '%s/%d/%s/%s'."
+        " Aborting connection.",
+        service->name,
+        service->proto,
+        service->bind_iface,
+        service->connect_addr);
+    goto end;
+  }
+
+
 
   if ( (cb = co_recv(so1, &token.ticket, sizeof(token.ticket), 0)) != sizeof(token.ticket) ) {
     CF_FATAL("Can not read auth ticket, abort connection. cb=%zd", cb);
     goto end;
   }
 
-  CF_DEBUG("RECEIVED AUTH TICKET=%llu", (unsigned long long )token.ticket);
 
+
+  CF_DEBUG("RECEIVED AUTH TICKET=%llu", (unsigned long long )token.ticket);
   if ( !search_auth_tocken(token.ticket, &token) ) {
-    CF_FATAL("Inalid ticket received=%llu, abort connection", (unsigned long long )token.ticket);
+    CF_FATAL("CRITICAL: RECEIVED TICKET = %llu NOT FOUND. "
+        "Aborting connection.",
+        (unsigned long long )token.ticket);
     goto end;
   }
 
-  CF_DEBUG("POP-ED AUTH TICKET=%llu", (unsigned long long )token.ticket);
 
-
-  // fixme: make connection to actual internal (hidden) web service
-  so_sockaddr_in(g_tunip, 80, &addrs);
+  so_sockaddr_in(g_tunip, connect_port, &addrs);
   if ( (so2 = co_tcp_connect((struct sockaddr*) &addrs, sizeof(addrs), 5)) == -1 ) {
     CF_FATAL("co_tcp_connect() fails, abort connection: %s", strerror(errno));
     goto end;
   }
 
+
   CF_NOTICE("ESTABLISHED");
+
 
   // start data exchange
   if ( !co_ddx(so1,  so2) ) {
     CF_FATAL("co_ddx() fails");
   }
-
 
 end:
 
@@ -492,44 +529,73 @@ end:
 
 
 
-static int micro_client_accept(void * arg, uint32_t events)
+static int micro_tcp_accept(void * arg, uint32_t events)
 {
-  (void)(events);
-
-  int so1, so2;
-
-  so1 = (int) (ssize_t) (arg);
+  struct services_table_item * service = arg;
+  struct micro_tcp_thread_arg * args;
+  int so;
 
   if ( events & EPOLLERR ) {
     CF_FATAL("FATAL : EPOLLERR");
-    so_close(so1, false);
-    return 1;
+    so_close(service->so, false);
+    service->so = -1;
+    return -1;
   }
 
-  // fixme for cuttle: EPOLLET
-  while ( (so2 = accept(so1, NULL, NULL)) != -1 ) {
-    so_set_non_blocking(so2, true);
-    if ( !co_schedule(micro_client_thread, (void*) (ssize_t) (so2), CO_STACK_SIZE) ) {
-      CF_FATAL("co_schedule(micro_client_thread) fails");
-      so_close(so2, false);
+  while ( (so = accept(service->so, NULL, NULL)) != -1 ) {
+
+    so_set_non_blocking(so, true);
+
+    if ( !(args = malloc(sizeof(struct micro_tcp_thread_arg))) ) {
+      CF_FATAL("malloc(micro_tcp_thread_arg) fails");
+      so_close(so, false);
+      continue;
     }
+
+    args->service = service;
+    args->so = so;
+
+    if ( !co_schedule(micro_tcp_thread, args, CO_STACK_SIZE) ) {
+      CF_FATAL("co_schedule(micro_tcp_thread) fails");
+      free(args);
+      so_close(so, false);
+    }
+
+    co_yield();
   }
 
   return 0;
 }
 
-static bool start_micro_client_server(const char * listen_address, uint16_t listen_port)
-{
-  int so;
+//const char * connect_address;
+//uint16_t connect_port;
 
-  if ( (so = so_tcp_listen(listen_address, listen_port, NULL)) == -1 ) {
-    CF_FATAL("so_tcp_listen(bindaddrs=%s:%u) fails", listen_address, listen_port);
+static bool start_micro_tcp_server(struct services_table_item * service)
+{
+  uint32_t address = 0;
+  uint16_t port = 0;
+
+  if ( !cf_get_iface_address(service->bind_iface, &address, &port) ) {
+    CF_FATAL("Can't get ip address for requested device '%s'", service->bind_iface);
     return false;
   }
 
-  so_set_non_blocking(so, 1);
-  if ( !co_schedule_io(so, EPOLLIN, micro_client_accept, (void *) (ssize_t) (so), CO_STACK_SIZE) ) {
+  if ( address == 0 || port == 0 ) {
+    CF_FATAL("Invalid device address : port specified '%s'", service->bind_iface);
+    return false;
+  }
+
+
+  if ( (service->so = so_tcp_listen2(address, port, NULL)) == -1 ) {
+    CF_FATAL("so_tcp_listen('%s') fails", service->bind_iface);
+    return false;
+  }
+
+  so_set_non_blocking(service->so, 1);
+  if ( !co_schedule_io(service->so, EPOLLIN, micro_tcp_accept, service, CO_STACK_SIZE) ) {
     CF_FATAL("co_schedule_io(micro_client_accept) fails: %s", strerror(errno));
+    close(service->so);
+    service->so = -1;
     return false;
   }
 
@@ -741,6 +807,79 @@ end:
 
 /////////////////////////////////////////////////////////////////////////////
 
+/**
+ * Print vesion information
+ */
+static void show_version()
+{
+  printf("%s\n", CSHELL_VERSION);
+}
+
+static void show_usage()
+{
+  printf("cshell-client %s\n\n", VERSION);
+  printf("USAGE\n");
+  printf("  cshell-client [OPTIONS]\n\n");
+  printf("OPTIONS:\n");
+  printf(" --no-daemon, -n\n");
+  printf("      don't fork, run in foreground mode\n");
+  printf(" --cid=<client-id> \n");
+  printf("      this client id\n");
+  printf(" --smaster=<ip:port>\n");
+  printf("      ip:port of master server\n");
+  printf(" --phys=<physip:port>\n");
+  printf("      optional name of tunnel interface, will auto generated if not specified\n");
+  printf(" --iface=<tun-interface-name>\n");
+  printf("      optional name of tunnel interface, will auto generated if not specified\n");
+}
+
+
+//
+static bool parseopt(char * key, char * value)
+{
+  size_t i;
+
+  static const char * ignore[] =
+    { "help", "-help", "--help", "version", "version", "config", "no-daemon" };
+
+  for ( i = 0; i < sizeof(ignore) / sizeof(ignore[0]); ++i ) {
+    if ( strcmp(key, ignore[i]) == 0 ) {
+      return true;
+    }
+  }
+
+
+  if ( strcmp(key, "cid") == 0 ) {
+    strncpy(g_client_id, value, sizeof(g_client_id) - 1);
+  }
+  else if ( strcmp(key, "smaster") == 0 ) {
+    if ( sscanf(value, "%255[^:]:%hu", g_master_server_ip, &g_master_server_port) < 1 ) {
+      fprintf(stderr, "Invalid ip address specified for '%s' key: '%s'\n", key, value);
+      return false;
+    }
+  }
+  else if ( strcmp(key, "phys") == 0 ) {
+    if ( sscanf(value, "%255[^:]:%hu", g_phys_addrs, &g_phys_port) < 1 ) {
+      fprintf(stderr, "Invalid ip address specified for '%s' key : '%s'\n", key, value);
+      return false;
+    }
+  }
+  else if ( strcmp(key, "iface") == 0 ) {
+    strncpy(g_tuniface, value, sizeof(g_tuniface) - 1);
+  }
+  else if ( strcmp(key, "services") == 0 ) {
+    strncpy(g_services_table_pathname, value, sizeof(g_services_table_pathname) - 1);
+  }
+
+  //////////////////////////////////////////////////////////////////////////////////////////////
+  else {
+    fprintf(stderr, "Invalid key %s\n", key);
+    return false;
+  }
+
+  return true;
+}
+
 
 int main(int argc, char *argv[])
 {
@@ -750,120 +889,111 @@ int main(int argc, char *argv[])
 
   int tunfd = -1;
 
-
   int i;
 
 
+  ///////////////////////////////////////////////////////////////////////////////////////////
+
+  /* Search command line for config file name.
+   * The reason is that command line arguments can override the values provided by cfg file,
+   * therefore we have to read cfg first, and parse command line arguments after
+   * */
+  for ( i = 1; i < argc; ++i ) {
+    if ( strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-help") == 0 ) {
+      show_usage();
+      return EXIT_SUCCESS;
+    }
+    if ( strcmp(argv[i], "--version") == 0 || strcmp(argv[i], "-version") == 0 ) {
+      show_version();
+      return EXIT_SUCCESS;
+    }
+    if ( strncmp(argv[i], "--config=", 9) == 0 ) {
+      strncpy(g_config_file_name, argv[i] + 9, sizeof(g_config_file_name) - 1);
+    }
+    else if ( strcmp(argv[i], "--no-daemon") == 0 ) {
+      daemon_mode = 0;
+    }
+  }
+
+  /* search client cfg in default locations if not specified */
+  if ( !*g_config_file_name ) {
+    cf_find_config_file("cshell-client.cfg", g_config_file_name);
+  }
+
+  /* Read client config file if exists */
+  if ( *g_config_file_name && !cf_read_config_file(g_config_file_name, parseopt) ) {
+    return EXIT_FAILURE;
+  }
 
 
-
-  /* parse command line */
+  /* Parse command line options, overriding config file settings
+   * */
   for ( i = 1; i < argc; ++i ) {
 
-    //////////////////////////////////////////////////////////////////////////////////////////////
-    if ( strcmp(argv[i], "-help") == 0 || strcmp(argv[i], "--help") == 0 ) {
-      printf("cshell-client %s\n\n", VERSION);
-      printf("USAGE\n");
-      printf("  cshell-client [OPTIONS]\n\n");
-      printf("OPTIONS:\n");
-      printf(" --no-daemon, -n\n");
-      printf("      don't fork, run in foreground mode\n");
-      printf(" --cid\n");
-      printf("      this client id\n");
-      printf(" --smaster <ip:port>\n");
-      printf("      ip:port of master server\n");
-      printf(" --iface <tun-interface-name>\n");
-      printf("      optional name of tunnel interface, will auto generated if not specified\n");
+    char keyname[256] = "", keyvalue[256] = "";
 
+    const char * arg = argv[i];
 
-      return 0;
+    if ( strncmp(arg, "--", 2) == 0 ) {
+      arg += 2;
     }
 
+    sscanf(arg, "%255[^=]=%255s", keyname, keyvalue);
 
-    //////////////////////////////////////////////////////////////////////////////////////////////
-    if ( strcmp(argv[i], "--no-daemon") == 0 || strcmp(argv[i], "-n") == 0 ) {
-      daemon_mode = false;
-    }
-
-    //////////////////////////////////////////////////////////////////////////////////////////////
-    else if ( strcmp(argv[i], "--cid") == 0 ) {
-      if ( ++i >= argc ) {
-        fprintf(stderr, "Missing argument after %s command line switch\n", argv[i - 1]);
-        return 1;
-      }
-      strncpy(g_client_id, argv[i], sizeof(g_client_id) - 1);
-    }
-
-    //////////////////////////////////////////////////////////////////////////////////////////////
-    else if ( strcmp(argv[i], "--smaster") == 0 ) {
-      if ( ++i >= argc ) {
-        fprintf(stderr, "Missing argument after %s command line switch\n", argv[i - 1]);
-        return 1;
-      }
-
-      if ( sscanf(argv[i], "%255[^:]:%hu", g_master_server_ip, &g_master_server_port) < 1 ) {
-        fprintf(stderr, "Invalid argument after %s command line switch\n", argv[i - 1]);
-        return 1;
-      }
-    }
-
-    //////////////////////////////////////////////////////////////////////////////////////////////
-    else if ( strcmp(argv[i], "--phys") == 0 ) {
-      if ( ++i >= argc ) {
-        fprintf(stderr, "Missing argument after %s command line switch\n", argv[i - 1]);
-        return 1;
-      }
-
-      if ( sscanf(argv[i], "%255[^:]:%hu", g_phys_addrs, &g_phys_port) < 1 ) {
-        fprintf(stderr, "Invalid argument after %s command line switch\n", argv[i - 1]);
-        return 1;
-      }
-    }
-
-    //////////////////////////////////////////////////////////////////////////////////////////////
-    else if ( strcmp(argv[i], "--iface") == 0 ) {
-      if ( ++i >= argc ) {
-        fprintf(stderr, "Missing argument after %s command line switch\n", argv[i - 1]);
-        return 1;
-      }
-      strncpy(g_tuniface, argv[i], sizeof(g_tuniface) - 1);
-    }
-
-    //////////////////////////////////////////////////////////////////////////////////////////////
-    else {
-      fprintf(stderr, "Invalid argument %s\n", argv[i]);
-      return 1;
+    if ( !parseopt(keyname, keyvalue) ) {
+      return EXIT_FAILURE;
     }
   }
 
-  if ( !*g_phys_addrs || !g_phys_port ) {
-    fprintf(stderr, "--phys not specified or invalid\n");
-    return 1;
-  }
 
 
   cf_set_logfilename("stderr");
   cf_set_loglevel(CF_LOG_DEBUG);
 
 
+  ///////////////////////////////////////////////////////////////////////////////////////////
+
+  /* check config */
+
+  if ( !*g_phys_addrs || !g_phys_port ) {
+    CF_FATAL("--phys not specified or invalid\n");
+    return EXIT_FAILURE;
+  }
+
+  if ( !*g_services_table_pathname ) {
+    cf_find_config_file("cshell-services.cfg", g_services_table_pathname);
+  }
+
+  if ( !*g_services_table_pathname ) {
+    CF_NOTICE("\nWARNING: Not services table provided, not services will available!\n\n");
+  }
+  else if ( !load_services_table(g_services_table_pathname) ) {
+    CF_FATAL("FATAL: Fail to load services table from '%s'\n", g_services_table_pathname);
+    return EXIT_FAILURE;
+  }
+
+
+  ///////////////////////////////////////////////////////////////////////////////////////////
+
+
 
   CF_DEBUG("cf_ssl_initialize()");
   if ( !cf_ssl_initialize() ) {
     CF_FATAL("cf_ssl_initialize() fails: %s", strerror(errno));
-    return 1;
+    return EXIT_FAILURE;
   }
 
   CF_DEBUG("co_scheduler_init(1)");
   if ( !co_scheduler_init(1) ) {
     CF_FATAL("co_scheduler_init() fails: %s", strerror(errno));
-    return 1;
+    return EXIT_FAILURE;
   }
 
   // start smaster authentication, results in opened smaster channel and retrived tunip
   CF_DEBUG("co_schedule(master_authenticate()");
   if ( !co_schedule(master_authenticate, NULL, CO_STACK_SIZE) ) {
     CF_FATAL("co_schedule(master_authenticate) fails: %s", strerror(errno));
-    return 1;
+    return EXIT_FAILURE;
   }
 
   // Wait util authentication finished
@@ -874,7 +1004,7 @@ int main(int argc, char *argv[])
 
   CF_DEBUG("auth finished: tunip='%s'", g_tunip);
   if ( !*g_tunip ) {
-    return 1;
+    return EXIT_FAILURE;
   }
 
 
@@ -889,7 +1019,7 @@ int main(int argc, char *argv[])
   if ( (tunfd = open_tunnel(g_node, g_tuniface, g_tunip, g_ifacemask, g_ifaceflags)) == -1 ) {
     CF_FATAL("open_tunnel(node=%s, tuniface=%s, tunip=%s, ifacemask=%s, ifaceflags=0x%0X) fails: %s",
         g_node, g_tuniface, g_tunip, g_ifacemask, g_ifaceflags, strerror(errno));
-    return 1;
+    return EXIT_FAILURE;
   }
 
   CF_DEBUG("Tunnel name: '%s'", g_tuniface);
@@ -903,25 +1033,49 @@ int main(int argc, char *argv[])
   CF_DEBUG("start_micro_server()");
   if ( !start_micro_server(g_tunip, 6001, &g_micro_tcp_server_bind_address) ) {
     CF_FATAL("start_microsrv(%s:6001) fails", g_tunip);
-    return 1;
+    return EXIT_FAILURE;
   }
 
   // Schedule tunnel ip forwarding
   CF_DEBUG("start_rdtun_cothread()");
   if ( !start_rdtun(tunfd, &g_micro_tcp_server_bind_address) ) {
     CF_FATAL("start_rdtun_cothread(tunfd=-1) fails: %s", strerror(errno));
-    return 1;
+    return EXIT_FAILURE;
   }
 
 
   // Schedule services micro stubs
-  CF_DEBUG("start_micro_client_server()");
-  if ( !start_micro_client_server(g_phys_addrs, g_phys_port) ) {
-    CF_FATAL("start_micro_client_server() fails: %s", strerror(errno));
-    return 1;
+  for ( i =0; ; ++i ) {
+
+    struct services_table_item * service = services_table_item(i);
+    if ( !service ) {
+      break;
+    }
+
+    switch ( service->proto ) {
+    case IPPROTO_TCP :
+
+      CF_DEBUG("start_micro_tcp_server(%s/%d/%s/%s)",
+          service->name,
+          service->proto,
+          service->bind_iface,
+          service->connect_addr);
+
+      if ( !start_micro_tcp_server(service) ) {
+        CF_FATAL("start_micro_client_server() fails: %s", strerror(errno));
+        return EXIT_FAILURE;
+      }
+      break;
+
+    case IPPROTO_UDP :
+      case IPPROTO_SCTP :
+      default :
+      break;
+    }
+
+
+
   }
-
-
 
 
 
@@ -936,7 +1090,7 @@ int main(int argc, char *argv[])
 
     case -1 :
       fprintf(stderr, "fork() fails: %s", strerror(errno));
-      return 1;
+      return EXIT_FAILURE;
 
     case 0 :
       // in child, continue initialization
@@ -948,16 +1102,22 @@ int main(int argc, char *argv[])
       return 0;
     }
 
-    cf_set_logfilename("cshell-client.log");
+    if ( access("/var/log", W_OK) == 0 ) {
+      cf_set_logfilename("/var/log/cshell-client.log");
+    }
+    else {
+      cf_set_logfilename("cshell-client.log");
+    }
   }
 
 
+  /* Fixme: msut exit on internal runtime error, or when smaster connecion is lost */
   CF_DEBUG("co_sleep()");
-
   while ( 42 ) {
-    co_sleep(100000);
+    co_sleep(10000);
   }
 
+  CF_DEBUG("FINISH");
   return 0;
 }
 

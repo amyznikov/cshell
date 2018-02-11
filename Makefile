@@ -43,22 +43,41 @@ LDLIBS = -L/usr/local/lib -lcuttle -lssl -lcrypto -pthread
 # 
 
 
+HEADERS = $(wildcard src/*.h)
 
 COMMON_SOURCES = src/so-msg.c src/corpc-msg.c
 
-CLIENT_SOURCES = $(COMMON_SOURCES) src/cshell-client.c src/tunnel.c  src/rdtun.c src/checksum.c src/ip-pkt.c
-SERVER_SOURCES = $(COMMON_SOURCES) src/cshell-server.c
-ROUTER_SOURCES = $(COMMON_SOURCES) src/cshell-router.c
-TCPTST_SOURCES = $(COMMON_SOURCES) src/raw-tcp-tester.c
+CLIENT_SOURCES = $(COMMON_SOURCES) \
+	src/cshell-client.c \
+	src/tunnel.c  \
+	src/rdtun.c \
+	src/checksum.c \
+	src/ip-pkt.c \
+	src/services.c
+	
+
+
+SERVER_SOURCES = $(COMMON_SOURCES) \
+	src/cshell-server.c
+
+ROUTER_SOURCES = $(COMMON_SOURCES) \
+	src/cshell-router.c
+
+TCPTST_SOURCES = $(COMMON_SOURCES) \
+	src/raw-tcp-tester.c
+
 
 CLIENT_MODULES = $(addsuffix .o, $(basename $(CLIENT_SOURCES)))
 SERVER_MODULES = $(addsuffix .o, $(basename $(SERVER_SOURCES))) 
 ROUTER_MODULES = $(addsuffix .o, $(basename $(ROUTER_SOURCES)))
 TCPTST_MODULES = $(addsuffix .o, $(basename $(TCPTST_SOURCES)))
 
+$(CLIENT_MODULES) : $(HEADERS)
+$(SERVER_MODULES) : $(HEADERS)
+$(ROUTER_MODULES) : $(HEADERS)
+$(ROUTER_MODULES) : $(HEADERS) 
+
 INCLUDES += -Isrc
-
-
 
 
 $(CLIENT): $(CLIENT_MODULES)

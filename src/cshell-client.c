@@ -36,6 +36,9 @@
 # define CSHELL_VERSION "0.0.0"
 #endif
 
+
+#define CO_STACK_SIZE   (64*1024*1024)
+
 static const char VERSION[] = CSHELL_VERSION;
 
 static corpc_channel * g_smaster_channel;
@@ -81,26 +84,57 @@ struct so_ddx_thread_arg {
 static int co_ddx_thread(void * arg, uint32_t events)
 {
   struct so_ddx_thread_arg * ddxarg = arg;
-  char buf[8 * 1024];
-  ssize_t cb;
+  char buf[4 * 1024];
+  ssize_t cbr, cbs;
+
+  CF_DEBUG("[%d -> %d] events=0x%0X", ddxarg->src, ddxarg->dst, events);
 
   if ( events & EPOLLERR ) {
     ddxarg->finished = true;
   }
   else {
-    while ( (cb = recv(ddxarg->src, buf, sizeof(buf), 0)) > 0 ) {
-      if ( (cb = co_send(ddxarg->dst, buf, cb, 0)) < 0 ) {
+    while ( (cbr = recv(ddxarg->src, buf, sizeof(buf), MSG_DONTWAIT)) > 0 ) {
+      if ( (cbs = send(ddxarg->dst, buf, cbr, 0)) != cbr ) {
         ddxarg->finished = true;
+        CF_FATAL("send() fails: cbr=%zd cbs=%zd errno=%s", cbr, cbs, strerror(errno));
         break;
       }
     }
+
+    if ( cbr == 0 ) {
+      ddxarg->finished = true;
+    }
+
+    CF_DEBUG("recv(src=%d, dst=%d): %zd, err=%s", ddxarg->src, ddxarg->dst, cbr, strerror(errno));
   }
+
 
   if ( ddxarg->finished ) {
     return -1;
   }
 
   return 0;
+}
+
+static void co_ddx_thread2(void * arg)
+{
+  struct so_ddx_thread_arg * ddxarg = arg;
+  char buf[4 * 1024];
+  ssize_t cbr, cbs;
+
+  CF_DEBUG("[%d -> %d]", ddxarg->src, ddxarg->dst);
+
+  while ( (cbr = co_recv(ddxarg->src, buf, sizeof(buf), 0)) > 0 ) {
+    if ( (cbs = co_send(ddxarg->dst, buf, cbr, 0)) != cbr ) {
+      ddxarg->finished = true;
+      CF_FATAL("co_send() fails: cbr=%zd cbs=%zd errno=%s", cbr, cbs, strerror(errno));
+      break;
+    }
+  }
+
+  ddxarg->finished = true;
+  CF_DEBUG("recv(src=%d, dst=%d): %zd, err=%s", ddxarg->src, ddxarg->dst, cbr, strerror(errno));
+  CF_WARNING("[%d -> %d] FINISHED", ddxarg->src, ddxarg->dst);
 }
 
 static bool co_ddx(int so1, int so2)
@@ -117,20 +151,31 @@ static bool co_ddx(int so1, int so2)
     .finished = false
   };
 
-  if ( !co_schedule_io(so1, EPOLLIN, co_ddx_thread, &arg1, 16 * 1024) ) {
-    CF_FATAL("co_schedule_io(co_ddx_thread) fails");
+
+  so_set_recv_timeout(so1, 5);
+  so_set_recv_timeout(so2, 5);
+  so_set_send_timeout(so1, 5);
+  so_set_send_timeout(so2, 5);
+
+  CF_DEBUG("co_schedule(co_ddx_thread2(so1=%d -> so2=%d) arg1=%p", so1, so2, &arg1);
+  if ( !co_schedule(co_ddx_thread2, &arg1, CO_STACK_SIZE) ) {
+    CF_FATAL("co_schedule_io(co_ddx_thread2) fails");
     return false;
   }
 
-  if ( !co_schedule_io(so2, EPOLLIN, co_ddx_thread, &arg2, 16 * 1024) ) {
-    CF_FATAL("co_schedule_io(co_ddx_thread) fails");
+  CF_DEBUG("co_schedule(co_ddx_thread2(so2=%d -> so1=%d) arg2=%p", so2, so1, &arg2);
+  if ( !co_schedule(co_ddx_thread2, &arg2, CO_STACK_SIZE) ) {
+    CF_FATAL("co_schedule_io(co_ddx_thread2) fails");
     return false;
   }
 
-  while ( !arg1.finished && !arg2.finished ) {
-    co_sleep(500);
+  while ( !arg1.finished || !arg2.finished ) {
+    CF_DEBUG("co_sleep(1000)");
+    co_sleep(1000);
   }
 
+
+  CF_NOTICE("******** %d <=> %d FINISHED", so1, so2);
   return true;
 }
 
@@ -224,9 +269,9 @@ static void micro_server_thread(void * arg)
 
   uint64_t ticket = 0;
   char actual_resource_location[SM_MAX_ACTUAL_RESOURCE_ADDRESS] = "";
-  const struct rtable_item * item;
+  const struct tunnel_route_table_item * item;
 
-  char buf[1024] = "";
+  char buf[4 * 1024] = "";
 
   int so1 = -1, so2 = -1;
 
@@ -262,7 +307,7 @@ static void micro_server_thread(void * arg)
   so_sockaddr_in(actual_resource_location, ntohs(item->dst.sin_port), &addrs);
 
   if ( (so2 = co_tcp_connect((struct sockaddr*) &addrs, sizeof(addrs), 10)) == -1 ) {
-    CF_FATAL("co_tcp_connect(%s:%u) fails", inet_ntoa(addrs.sin_addr), ntohs(addrs.sin_port));
+    CF_FATAL("co_tcp_connect(%s:%u) fails: %s", inet_ntoa(addrs.sin_addr), ntohs(addrs.sin_port), strerror(errno));
     sprintf(buf, "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/html; charset=ISO-8859-1\r\n"
         "\r\n"
@@ -274,7 +319,7 @@ static void micro_server_thread(void * arg)
 
   // send auth ticket
 
-  CF_DEBUG("Send auth.ticket=%llu", (unsigned long long ) ticket);
+  CF_DEBUG("Send auth.ticket=%llu so1=%d so2=%d", (unsigned long long ) ticket, so1, so2);
 
   if ( !co_send(so2, &ticket, sizeof(ticket), 0) ) {
     CF_FATAL("co_send(ticket) fails");
@@ -285,6 +330,7 @@ static void micro_server_thread(void * arg)
     goto end;
   }
 
+  CF_DEBUG("co_send(so1=%d so2=%d) OK", so1, so2);
 
   fOk = true;
 
@@ -295,7 +341,9 @@ static void micro_server_thread(void * arg)
 end:
 
   if ( !fOk ) {
-    co_send(so1, buf, strlen(buf), 0);
+    if ( so1 != -1 ) {
+      co_send(so1, buf, strlen(buf), 0);
+    }
   }
 
   if ( so1 != -1 ) {
@@ -328,7 +376,7 @@ static int micro_server_accept(void * arg, uint32_t events)
 
   while ( (so2 = accept(so1, NULL, NULL)) != -1 ) {
     so_set_non_blocking(so2, true);
-    if ( !co_schedule(micro_server_thread, (void*) (ssize_t) (so2), 1024 * 1024) ) {
+    if ( !co_schedule(micro_server_thread, (void*) (ssize_t) (so2), CO_STACK_SIZE) ) {
       CF_FATAL("co_schedule(microsrv_client_thread) fails");
       so_close(so2, false);
     }
@@ -349,7 +397,7 @@ static bool start_micro_server(const char * listen_addrs, uint16_t listen_port,
   }
 
   so_set_non_blocking(g_microsrvfd, true);
-  if ( !co_schedule_io(g_microsrvfd, EPOLLIN, micro_server_accept, (void *) (ssize_t) (g_microsrvfd), 256 * 1024) ) {
+  if ( !co_schedule_io(g_microsrvfd, EPOLLIN, micro_server_accept, (void *) (ssize_t) (g_microsrvfd), CO_STACK_SIZE) ) {
     CF_FATAL("co_schedule_io(microsrv_accept) fails: %s", strerror(errno));
     return false;
   }
@@ -444,7 +492,7 @@ static void micro_client_thread(void * arg)
   // fixme: make connection to actual internal (hidden) web service
   so_sockaddr_in(g_tunip, 80, &addrs);
   if ( (so2 = co_tcp_connect((struct sockaddr*) &addrs, sizeof(addrs), 5)) == -1 ) {
-    CF_FATAL("so_tcp_connect() fails, abort connection");
+    CF_FATAL("co_tcp_connect() fails, abort connection: %s", strerror(errno));
     goto end;
   }
 
@@ -486,7 +534,7 @@ static int micro_client_accept(void * arg, uint32_t events)
   // fixme for cuttle: EPOLLET
   while ( (so2 = accept(so1, NULL, NULL)) != -1 ) {
     so_set_non_blocking(so2, true);
-    if ( !co_schedule(micro_client_thread, (void*) (ssize_t) (so2), 1024 * 1024) ) {
+    if ( !co_schedule(micro_client_thread, (void*) (ssize_t) (so2), CO_STACK_SIZE) ) {
       CF_FATAL("co_schedule(micro_client_thread) fails");
       so_close(so2, false);
     }
@@ -505,7 +553,7 @@ static bool start_micro_client_server(const char * listen_address, uint16_t list
   }
 
   so_set_non_blocking(so, 1);
-  if ( !co_schedule_io(so, EPOLLIN, micro_client_accept, (void *) (ssize_t) (so), 256 * 1024) ) {
+  if ( !co_schedule_io(so, EPOLLIN, micro_client_accept, (void *) (ssize_t) (so), CO_STACK_SIZE) ) {
     CF_FATAL("co_schedule_io(micro_client_accept) fails: %s", strerror(errno));
     return false;
   }
@@ -838,7 +886,7 @@ int main(int argc, char *argv[])
 
   // start smaster authentication, results in opened smaster channel and retrived tunip
   CF_DEBUG("co_schedule(master_authenticate()");
-  if ( !co_schedule(master_authenticate, NULL, 1024 * 1024) ) {
+  if ( !co_schedule(master_authenticate, NULL, CO_STACK_SIZE) ) {
     CF_FATAL("co_schedule(master_authenticate) fails: %s", strerror(errno));
     return 1;
   }

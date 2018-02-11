@@ -10,68 +10,112 @@
 #include <cuttle/ccarray.h>
 #include <cuttle/sockopt.h>
 #include <cuttle/cothread/scheduler.h>
+//#include </inet.h>
 #include <arpa/inet.h>
 #include "rdtun.h"
 #include "checksum.h"
 #include "ip-pkt.h"
 
+#define CO_STACK_SIZE   (16*1024*1024)
 
 
-static ccarray_t rtable; /* <struct rtable_item> */
+static ccarray_t g_tunnel_route_table; /* <struct tunnel_route_table_item> */
 struct sockaddr_in g_tcp_dst_address;
 
-static ssize_t rtable_find_resp(struct in_addr addr, in_port_t port)
+
+// sockaddr_in stupid comparator
+static int rspcmp(const struct tunnel_route_table_item * item, const struct sockaddr_in * rsp)
 {
-  size_t i, n;
-  for ( i = 0, n = ccarray_size(&rtable); i < n; ++i ) {
-    struct rtable_item * item = ccarray_peek(&rtable, i);
-    if ( item->rsp.sin_addr.s_addr == addr.s_addr && item->rsp.sin_port == port ) {
-      return i;
+  if ( item->rsp.sin_addr.s_addr < rsp->sin_addr.s_addr ) {
+    return -1;
+  }
+  if ( item->rsp.sin_addr.s_addr > rsp->sin_addr.s_addr ) {
+    return +1;
+  }
+  if ( item->rsp.sin_port < rsp->sin_port ) {
+    return -1;
+  }
+  if ( item->rsp.sin_port > rsp->sin_port ) {
+    return +1;
+  }
+  return 0;
+}
+
+struct tunnel_route_table_item * rtable_get_rsp(struct in_addr addr, in_port_t port)
+{
+  const struct sockaddr_in rsp = {
+    .sin_family = AF_INET,
+    .sin_addr = addr,
+    .sin_port = port,
+    .sin_zero = {}
+  };
+
+  const size_t size = ccarray_size(&g_tunnel_route_table);
+  const size_t pos = ccarray_lowerbound(&g_tunnel_route_table, 0, size, (cmpfunc_t)rspcmp, &rsp);
+
+  if ( pos < size ) {
+    struct tunnel_route_table_item * item = ccarray_peek(&g_tunnel_route_table, pos);
+    if ( rspcmp(item, &rsp) == 0 ) {
+      return item;
     }
   }
-  return -1;
+  return NULL;
 }
 
-
-struct rtable_item * rtable_get_rsp(struct in_addr addr, in_port_t port)
-{
-  ssize_t pos = rtable_find_resp(addr, port);
-  return pos < 0 ? NULL : ccarray_peek(&rtable, pos);
-}
 
 static void rtable_add_route(struct in_addr srcaddr, in_port_t srcport,
     struct in_addr dstaddr, in_port_t dstport,
-    struct in_addr respaddr, in_port_t respport )
+    struct in_addr rspaddr, in_port_t rspport )
 {
-  struct sockaddr_in src, dst, resp;
-  memset(&src, 0, sizeof(src));
-  memset(&dst, 0, sizeof(dst));
-  memset(&resp, 0, sizeof(resp));
+  const struct sockaddr_in src = {
+    .sin_family = AF_INET,
+    .sin_addr = srcaddr,
+    .sin_port = srcport,
+    .sin_zero = {}
+  };
 
-  src.sin_addr = srcaddr;
-  src.sin_port = srcport;
+  const struct sockaddr_in dst = {
+    .sin_family = AF_INET,
+    .sin_addr = dstaddr,
+    .sin_port = dstport,
+    .sin_zero = {}
+  };
 
-  dst.sin_addr = dstaddr;
-  dst.sin_port = dstport;
+  const struct sockaddr_in rsp = {
+    .sin_family = AF_INET,
+    .sin_addr = rspaddr,
+    .sin_port = rspport,
+    .sin_zero = {}
+  };
 
-  resp.sin_addr = respaddr;
-  resp.sin_port = respport;
+  struct tunnel_route_table_item * item;
 
-  ssize_t pos = rtable_find_resp(resp.sin_addr, resp.sin_port);
-  if ( pos < 0 ) {
-    CF_WARNING("rtable_find_resp() fails for %s:%u", inet_ntoa(resp.sin_addr), ntohs(resp.sin_port));
-    ccarray_push_back(&rtable, &(struct rtable_item ) {
+  const size_t size = ccarray_size(&g_tunnel_route_table);
+  const size_t pos = ccarray_lowerbound(&g_tunnel_route_table, 0, size, (cmpfunc_t) rspcmp, &rsp);
+
+  if ( pos >= size ) {
+    ccarray_push_back(&g_tunnel_route_table,
+        &(struct tunnel_route_table_item ) {
           .src = src,
           .dst = dst,
-          .rsp = resp,
+          .rsp = rsp
+        });
+  }
+  else if ( rspcmp(item = ccarray_peek(&g_tunnel_route_table, pos), &rsp) != 0 ) {
+    ccarray_insert(&g_tunnel_route_table, pos,
+        &(struct tunnel_route_table_item ) {
+          .src = src,
+          .dst = dst,
+          .rsp = rsp,
         });
   }
   else {
-    struct rtable_item * item = ccarray_peek(&rtable, pos);
     item->src = src;
     item->dst = dst;
   }
 }
+
+
 
 /* cothread version of rdtun() ip forwaring */
 static int rdtun(void * arg, uint32_t events)
@@ -89,7 +133,7 @@ static int rdtun(void * arg, uint32_t events)
   void * tcppld;
   size_t pldsize;
   ssize_t cb;
-  const struct rtable_item * item;
+  const struct tunnel_route_table_item * item;
 
 //  CF_DEBUG("***********************\n"
 //      "ENTER. tunfd=%d EVENTS = 0x%0X", tunfd, events);
@@ -134,7 +178,6 @@ static int rdtun(void * arg, uint32_t events)
       rtable_add_route(ip->ip_src, tcp->source, ip->ip_dst, tcp->dest, resp_addrs, resp_port);
 
       ip->ip_src.s_addr = ip->ip_dst.s_addr;
-      // tcp->source = tcp->dest;
 
       ip->ip_dst.s_addr = g_tcp_dst_address.sin_addr.s_addr;
       tcp->dest = g_tcp_dst_address.sin_port;
@@ -145,8 +188,8 @@ static int rdtun(void * arg, uint32_t events)
 
     // dumppkt("W", ip, iphsize, tcp, tcphsize, tcppld, pldsize);
 
-    if ( (cb = co_write(tunfd, ip, ntohs(ip->ip_len))) <= 0 ) {
-    //if ( (cb = write(tunfd, ip, ntohs(ip->ip_len))) <= 0 ) {
+    //if ( (cb = co_write(tunfd, ip, ntohs(ip->ip_len))) <= 0 ) {
+    if ( (cb = write(tunfd, ip, ntohs(ip->ip_len))) <= 0 ) {
       CF_FATAL("write(tunfd) fails: %s", strerror(errno));
     }
   }
@@ -162,14 +205,14 @@ bool start_rdtun(int tunfd, const struct sockaddr_in * tcp_dst_address)
 {
   g_tcp_dst_address = *tcp_dst_address;
 
-  if ( !ccarray_init(&rtable, 65535, sizeof(struct rtable_item)) ) {
+  if ( !ccarray_init(&g_tunnel_route_table, 65535, sizeof(struct tunnel_route_table_item)) ) {
     CF_FATAL("ccarray_init(rtable) fails: %s", strerror(errno));
     return false;
   }
 
   so_set_non_blocking(tunfd, 1);
 
-  if ( !co_schedule_io(tunfd, EPOLLIN, rdtun, (void *) (ssize_t) (tunfd), 500 * 1024) ) {
+  if ( !co_schedule_io(tunfd, EPOLLIN, rdtun, (void *) (ssize_t) (tunfd), CO_STACK_SIZE) ) {
     CF_FATAL("co_schedule_io(rdtun) fails: %s", strerror(errno));
     return false;
   }

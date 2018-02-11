@@ -29,7 +29,7 @@ CPPFLAGS= -DCSHELL_VERSION=\"$(VERSION)\"
 
 # C Compiler and flags
 CC=$(cross)gcc -std=gnu11
-CFLAGS=-Wall -Wextra -fPIC -O3 -g0 $(DEFINES) $(INCLUDES) 
+CFLAGS=-Wall -Wextra -fPIC -O2 -g3 $(DEFINES) $(INCLUDES) 
 
 # C++ Compiler and flags
 CXX=$(cross)gcc -std=c++11

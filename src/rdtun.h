@@ -21,14 +21,14 @@ extern "C" {
 #endif
 
 
-struct rtable_item {
+struct tunnel_route_table_item {
   struct sockaddr_in src, dst, rsp;
 };
 
 
 bool start_rdtun(int tunfd, const struct sockaddr_in * microsrv_bind_address);
 
-struct rtable_item * rtable_get_rsp(struct in_addr addr, in_port_t port);
+struct tunnel_route_table_item * rtable_get_rsp(struct in_addr addr, in_port_t port);
 
 #ifdef __cplusplus
 }

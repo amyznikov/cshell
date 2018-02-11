@@ -503,7 +503,7 @@ static void micro_tcp_thread(void * arg)
 
   so_sockaddr_in(g_tunip, connect_port, &addrs);
   if ( (so2 = co_tcp_connect((struct sockaddr*) &addrs, sizeof(addrs), 5)) == -1 ) {
-    CF_FATAL("co_tcp_connect() fails, abort connection: %s", strerror(errno));
+    CF_FATAL("co_tcp_connect(%s:%u) fails: %s", inet_ntoa(addrs.sin_addr), ntohs(addrs.sin_port), strerror(errno));
     goto end;
   }
 

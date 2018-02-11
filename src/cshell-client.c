@@ -65,60 +65,29 @@ static char g_tuniface[256] = "";
 /* tun device and file descriptor */
 static const char g_node[] = "/dev/net/tun";
 
-
-static int g_microsrvfd = -1;
-struct sockaddr_in g_tcp_dst_address;
+// micro server stub address:port, must be bound to tunip to work correctly
+static int g_g_micro_tcp_server_fd = -1;
+static struct sockaddr_in g_micro_tcp_server_bind_address;
 
 // IP addrs pf physical eth device
-char g_phys_addrs[16] = "";
-uint16_t g_phys_port = 80;
+static char g_phys_addrs[16] = "";
+static uint16_t g_phys_port = 80;
 
 
 /////////////////////////////////////////////////////////////////////////////
 
+/* data exchange between sockets :
+ *    recv from src, send to dst
+ */
 struct so_ddx_thread_arg {
   int src, dst;
   bool finished;
 };
 
-static int co_ddx_thread(void * arg, uint32_t events)
+static void co_ddx_thread(void * arg)
 {
   struct so_ddx_thread_arg * ddxarg = arg;
-  char buf[4 * 1024];
-  ssize_t cbr, cbs;
 
-  CF_DEBUG("[%d -> %d] events=0x%0X", ddxarg->src, ddxarg->dst, events);
-
-  if ( events & EPOLLERR ) {
-    ddxarg->finished = true;
-  }
-  else {
-    while ( (cbr = recv(ddxarg->src, buf, sizeof(buf), MSG_DONTWAIT)) > 0 ) {
-      if ( (cbs = send(ddxarg->dst, buf, cbr, 0)) != cbr ) {
-        ddxarg->finished = true;
-        CF_FATAL("send() fails: cbr=%zd cbs=%zd errno=%s", cbr, cbs, strerror(errno));
-        break;
-      }
-    }
-
-    if ( cbr == 0 ) {
-      ddxarg->finished = true;
-    }
-
-    CF_DEBUG("recv(src=%d, dst=%d): %zd, err=%s", ddxarg->src, ddxarg->dst, cbr, strerror(errno));
-  }
-
-
-  if ( ddxarg->finished ) {
-    return -1;
-  }
-
-  return 0;
-}
-
-static void co_ddx_thread2(void * arg)
-{
-  struct so_ddx_thread_arg * ddxarg = arg;
   char buf[4 * 1024];
   ssize_t cbr, cbs;
 
@@ -137,6 +106,10 @@ static void co_ddx_thread2(void * arg)
   CF_WARNING("[%d -> %d] FINISHED", ddxarg->src, ddxarg->dst);
 }
 
+/* data exchange between sockets :
+ *    recv from so1, send to so2
+ *    recv from so2, send to so1
+ */
 static bool co_ddx(int so1, int so2)
 {
   struct so_ddx_thread_arg arg1 = {
@@ -153,24 +126,25 @@ static bool co_ddx(int so1, int so2)
 
 
   so_set_recv_timeout(so1, 5);
-  so_set_recv_timeout(so2, 5);
   so_set_send_timeout(so1, 5);
+
+  so_set_recv_timeout(so2, 5);
   so_set_send_timeout(so2, 5);
 
-  CF_DEBUG("co_schedule(co_ddx_thread2(so1=%d -> so2=%d) arg1=%p", so1, so2, &arg1);
-  if ( !co_schedule(co_ddx_thread2, &arg1, CO_STACK_SIZE) ) {
+  CF_DEBUG("co_schedule(co_ddx_thread(so1=%d -> so2=%d) arg1=%p", so1, so2, &arg1);
+  if ( !co_schedule(co_ddx_thread, &arg1, CO_STACK_SIZE) ) {
     CF_FATAL("co_schedule_io(co_ddx_thread2) fails");
     return false;
   }
 
-  CF_DEBUG("co_schedule(co_ddx_thread2(so2=%d -> so1=%d) arg2=%p", so2, so1, &arg2);
-  if ( !co_schedule(co_ddx_thread2, &arg2, CO_STACK_SIZE) ) {
+  CF_DEBUG("co_schedule(co_ddx_thread(so2=%d -> so1=%d) arg2=%p", so2, so1, &arg2);
+  if ( !co_schedule(co_ddx_thread, &arg2, CO_STACK_SIZE) ) {
     CF_FATAL("co_schedule_io(co_ddx_thread2) fails");
     return false;
   }
 
   while ( !arg1.finished || !arg2.finished ) {
-    CF_DEBUG("co_sleep(1000)");
+    CF_DEBUG("REMOVE ME AFTER DEBUG: co_sleep(1000)");
     co_sleep(1000);
   }
 
@@ -391,13 +365,13 @@ static int micro_server_accept(void * arg, uint32_t events)
 static bool start_micro_server(const char * listen_addrs, uint16_t listen_port,
     /* out, opt */ struct sockaddr_in * bound_addrs)
 {
-  if ( (g_microsrvfd = so_tcp_listen(listen_addrs, listen_port, bound_addrs)) == -1 ) {
+  if ( (g_g_micro_tcp_server_fd = so_tcp_listen(listen_addrs, listen_port, bound_addrs)) == -1 ) {
     CF_FATAL("so_tcp_listen(bindaddrs=%s:%u) fails", listen_addrs, listen_port);
     return false;
   }
 
-  so_set_non_blocking(g_microsrvfd, true);
-  if ( !co_schedule_io(g_microsrvfd, EPOLLIN, micro_server_accept, (void *) (ssize_t) (g_microsrvfd), CO_STACK_SIZE) ) {
+  so_set_non_blocking(g_g_micro_tcp_server_fd, true);
+  if ( !co_schedule_io(g_g_micro_tcp_server_fd, EPOLLIN, micro_server_accept, (void *) (ssize_t) (g_g_micro_tcp_server_fd), CO_STACK_SIZE) ) {
     CF_FATAL("co_schedule_io(microsrv_accept) fails: %s", strerror(errno));
     return false;
   }
@@ -926,14 +900,14 @@ int main(int argc, char *argv[])
 
   // Schedule internal micro tcp server
   CF_DEBUG("start_micro_server()");
-  if ( !start_micro_server(g_tunip, 6001, &g_tcp_dst_address) ) {
+  if ( !start_micro_server(g_tunip, 6001, &g_micro_tcp_server_bind_address) ) {
     CF_FATAL("start_microsrv(%s:6001) fails", g_tunip);
     return 1;
   }
 
   // Schedule tunnel ip forwarding
   CF_DEBUG("start_rdtun_cothread()");
-  if ( !start_rdtun(tunfd, &g_tcp_dst_address) ) {
+  if ( !start_rdtun(tunfd, &g_micro_tcp_server_bind_address) ) {
     CF_FATAL("start_rdtun_cothread(tunfd=-1) fails: %s", strerror(errno));
     return 1;
   }

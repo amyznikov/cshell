@@ -44,7 +44,6 @@ static const char VERSION[] = CSHELL_VERSION;
 static corpc_channel * g_smaster_channel;
 static char g_master_server_ip[256] = "";
 static uint16_t g_master_server_port = 6010;
-static bool g_auth_finished = false;
 
 
 
@@ -70,17 +69,13 @@ static const char g_node[] = "/dev/net/tun";
 static int g_g_micro_tcp_server_fd = -1;
 static struct sockaddr_in g_micro_tcp_server_bind_address;
 
-// IP addrs pf physical eth device
-static char g_phys_addrs[16] = "";
-static uint16_t g_phys_port = 80;
-
-
 // patname to cshell-client config file
 static char g_config_file_name[PATH_MAX] = "";
 
 
 // patname to services table
 static char g_services_table_pathname[PATH_MAX] = "";
+
 
 
 /////////////////////////////////////////////////////////////////////////////
@@ -725,6 +720,29 @@ end :
 }
 
 
+/////////////////////////////////////////////////////////////////////////////
+
+static co_thread_lock_t g_auth_lock = CO_THREAD_LOCK_INITIALIZER;
+static bool g_auth_finished = false;
+
+static void set_auth_finished(bool value)
+{
+  co_thread_lock(&g_auth_lock);
+  g_auth_finished = value;
+  co_thread_broadcast(&g_auth_lock);
+  co_thread_unlock(&g_auth_lock);
+}
+
+static void wait_auth_finish(void)
+{
+  co_thread_lock(&g_auth_lock);
+  while ( !g_auth_finished ) {
+    co_thread_wait(&g_auth_lock, -1);
+  }
+  co_thread_unlock(&g_auth_lock);
+}
+
+
 static void master_authenticate(void * arg)
 {
   (void)(arg);
@@ -799,8 +817,10 @@ end:
     corpc_channel_close(&g_smaster_channel);
   }
 
-  g_auth_finished = true;
   CF_DEBUG("FINISHED");
+  CF_DEBUG("TUNIP='%s'", g_tunip);
+
+  set_auth_finished(true);
 }
 
 
@@ -827,8 +847,6 @@ static void show_usage()
   printf("      this client id\n");
   printf(" --smaster=<ip:port>\n");
   printf("      ip:port of master server\n");
-  printf(" --phys=<physip:port>\n");
-  printf("      optional name of tunnel interface, will auto generated if not specified\n");
   printf(" --iface=<tun-interface-name>\n");
   printf("      optional name of tunnel interface, will auto generated if not specified\n");
 }
@@ -855,12 +873,6 @@ static bool parseopt(char * key, char * value)
   else if ( strcmp(key, "smaster") == 0 ) {
     if ( sscanf(value, "%255[^:]:%hu", g_master_server_ip, &g_master_server_port) < 1 ) {
       fprintf(stderr, "Invalid ip address specified for '%s' key: '%s'\n", key, value);
-      return false;
-    }
-  }
-  else if ( strcmp(key, "phys") == 0 ) {
-    if ( sscanf(value, "%255[^:]:%hu", g_phys_addrs, &g_phys_port) < 1 ) {
-      fprintf(stderr, "Invalid ip address specified for '%s' key : '%s'\n", key, value);
       return false;
     }
   }
@@ -953,12 +965,7 @@ int main(int argc, char *argv[])
 
   ///////////////////////////////////////////////////////////////////////////////////////////
 
-  /* check config */
-
-  if ( !*g_phys_addrs || !g_phys_port ) {
-    CF_FATAL("--phys not specified or invalid\n");
-    return EXIT_FAILURE;
-  }
+  /* load services table */
 
   if ( !*g_services_table_pathname ) {
     cf_find_config_file("cshell-services.cfg", g_services_table_pathname);
@@ -983,29 +990,35 @@ int main(int argc, char *argv[])
     return EXIT_FAILURE;
   }
 
-  CF_DEBUG("co_scheduler_init(1)");
-  if ( !co_scheduler_init(1) ) {
+  CF_DEBUG("co_scheduler_init(2)");
+  if ( !co_scheduler_init(2) ) {
     CF_FATAL("co_scheduler_init() fails: %s", strerror(errno));
     return EXIT_FAILURE;
   }
 
-  // start smaster authentication, results in opened smaster channel and retrived tunip
+
+
+
+
+
+
+  // start smaster authentication, results in opened smaster channel and received g_tunip
+
   CF_DEBUG("co_schedule(master_authenticate()");
   if ( !co_schedule(master_authenticate, NULL, CO_STACK_SIZE) ) {
     CF_FATAL("co_schedule(master_authenticate) fails: %s", strerror(errno));
     return EXIT_FAILURE;
   }
 
-  // Wait util authentication finished
-  CF_DEBUG("while ( !g_auth_finished )");
-  while ( !g_auth_finished ) {
-    co_sleep(500);
-  }
+  // wait until authentication thread finishes
+  wait_auth_finish();
 
-  CF_DEBUG("auth finished: tunip='%s'", g_tunip);
+  // check if tunip was received from smaster
   if ( !*g_tunip ) {
     return EXIT_FAILURE;
   }
+
+
 
 
 
@@ -1036,6 +1049,7 @@ int main(int argc, char *argv[])
     return EXIT_FAILURE;
   }
 
+
   // Schedule tunnel ip forwarding
   CF_DEBUG("start_rdtun_cothread()");
   if ( !start_rdtun(tunfd, &g_micro_tcp_server_bind_address) ) {
@@ -1055,7 +1069,7 @@ int main(int argc, char *argv[])
     switch ( service->proto ) {
     case IPPROTO_TCP :
 
-      CF_DEBUG("start_micro_tcp_server(%s/%d/%s/%s)",
+      CF_NOTICE("start_micro_tcp_server(%s/%d/%s/%s)\n",
           service->name,
           service->proto,
           service->bind_iface,
@@ -1072,16 +1086,12 @@ int main(int argc, char *argv[])
       default :
       break;
     }
-
-
-
   }
 
 
 
 
   /* fork() and become daemon */
-  CF_DEBUG("if ( daemon_mode )");
   if ( daemon_mode ) {
 
     pid_t pid;
@@ -1111,7 +1121,7 @@ int main(int argc, char *argv[])
   }
 
 
-  /* Fixme: msut exit on internal runtime error, or when smaster connecion is lost */
+  /* Fixme: must exit on internal runtime error, or when smaster connecion is lost */
   CF_DEBUG("co_sleep()");
   while ( 42 ) {
     co_sleep(10000);
